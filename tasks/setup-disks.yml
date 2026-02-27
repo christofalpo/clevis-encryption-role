@@ -1,0 +1,61 @@
+---
+- name: "Wipe filesystem signatures from {{ disk_device }}"
+  ansible.builtin.command: wipefs -a "/dev/{{ disk_device }}"
+  changed_when: true
+
+- name: "Format {{ disk_device }} with LUKS2"
+  ansible.builtin.command: cryptsetup luksFormat --batch-mode --key-file {{ ansible_luks_key_path }}  "/dev/{{ disk_device }}"
+  args:
+    creates: "/dev/mapper/crypt-{{ disk_device }}"
+
+- name: "Bind {{ disk_device }} to Tang"
+  ansible.builtin.shell: |
+    clevis luks bind -d "/dev/{{ disk_device }}" -k "{{ ansible_luks_key_path }}" sss \
+    '{"t": 1, "pins": {"tang": [ {% for url_adv in tang_servers %}{"url": "{{ url_adv.url }}","adv":"{{ url_adv.adv }}"}{% if not loop.last %},{% endif %}{% endfor %}]}}'
+  args:
+    executable: /bin/bash
+
+- name: "Open {{ disk_device }}"
+  ansible.builtin.command: cryptsetup luksOpen --key-file {{ ansible_luks_key_path }} "/dev/{{ disk_device }}" "crypt-{{ disk_device }}"
+  args:
+    creates: "/dev/mapper/crypt-{{ disk_device }}"
+
+- name: "Close device to test network unlocking"
+  ansible.builtin.shell: |
+    if [ -b "/dev/mapper/crypt-{{ disk_device }}" ]; then
+      cryptsetup luksClose "crypt-{{ disk_device }}"
+    fi
+  changed_when: false
+
+- name: "Verify Tang decryption (1-of-N)"
+  # We attempt to open WITHOUT the key-file.
+  # This forces the system to use the Clevis token in the LUKS header.
+  ansible.builtin.shell: |
+    cryptsetup luksOpen "/dev/{{ disk_device }}" "crypt-{{ disk_device }}"
+  register: tang_verify
+  until: tang_verify.rc == 0
+  retries: 3
+  delay: 5
+  environment:
+    # Ensuring the path includes clevis binaries
+    PATH: "{{ ansible_env.PATH }}:/usr/bin:/usr/local/bin"
+
+- name: "Confirm device is open and accessible"
+  ansible.builtin.stat:
+    path: "/dev/mapper/crypt-{{ disk_device }}"
+  register: crypt_status
+  failed_when: not crypt_status.stat.exists
+
+- name: "Get UUID of {{ disk_device }}"
+  ansible.builtin.command: blkid -s UUID -o value "/dev/{{ disk_device }}"
+  register: disk_uuid
+  changed_when: false
+
+- name: "Add {{ disk_device }} to /etc/crypttab"
+  ansible.builtin.lineinfile:
+    path: /etc/crypttab
+    line: "crypt-{{ disk_device }} UUID={{ disk_uuid.stdout }} none luks,nofail,_netdev"
+    create: yes
+    mode: '0600'
+    owner: root
+    group: root

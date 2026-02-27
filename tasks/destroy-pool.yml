@@ -1,0 +1,41 @@
+---
+# roles/pve_destroy_zpool/tasks/main.yml
+
+# --- PHASE 1: Remove from Proxmox Configuration ---
+- name: Check if Proxmox storage pool '{{ target_pool }}' exists
+  ansible.builtin.command: "pvesm status -storage {{ target_pool }}"
+  register: pvesm_check
+  failed_when: false
+  changed_when: false
+  check_mode: false
+
+- name: Remove storage '{{ target_pool }}' from Proxmox configuration
+  ansible.builtin.command: "pvesm remove {{ target_pool }}"
+  when: pvesm_check.rc == 0
+
+# --- PHASE 2: Gather pool and disk information ---
+- name: Check if ZFS pool '{{ target_pool }}' exists on the OS
+  ansible.builtin.command: "zpool list {{ target_pool }}"
+  register: zpool_check
+  failed_when: false
+  changed_when: false
+  check_mode: false
+
+- name: Get list of devices used by the ZFS pool
+  # We use -P for full physical paths, and awk to isolate lines starting with /dev/
+  ansible.builtin.shell: "zpool status -P {{ target_pool }} | awk '$1 ~ /^\\/dev\\// {print $1}'"
+  register: zpool_devices
+  when: zpool_check.rc == 0
+  changed_when: false
+  check_mode: false
+
+# --- PHASE 3: Destroy pool and wipe disks ---
+- name: Destroy the ZFS pool '{{ target_pool }}'
+  ansible.builtin.command: "zpool destroy {{ target_pool }}"
+  when: zpool_check.rc == 0
+
+- name: Wipe filesystem signatures from the former ZFS devices
+  ansible.builtin.command: "wipefs -a {{ item }}"
+  loop: "{{ zpool_devices.stdout_lines | default([]) }}"
+  when: zpool_check.rc == 0
+

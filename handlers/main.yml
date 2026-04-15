@@ -1,0 +1,8 @@
+---
+# Tasks that write systemd unit files or drop-ins should notify this handler
+# rather than calling daemon_reload directly.  Ansible deduplicates handler
+# invocations, so the reload fires exactly once at the end of the play even
+# when multiple disks each trigger a notify.
+- name: "Reload systemd daemon"
+  ansible.builtin.systemd:
+    daemon_reload: true

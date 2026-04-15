@@ -1,0 +1,28 @@
+---
+galaxy_info:
+  role_name: clevis_encryption
+  author: kvalitetsit
+  description: >
+    LUKS2 disk encryption with Clevis/Tang network-bound unlock for Proxmox
+    data disks.  Creates an encrypted ZFS pool and configures correct systemd
+    boot ordering so the pool is always imported after the disks are unlocked.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - trixie
+  galaxy_tags:
+    - luks
+    - encryption
+    - proxmox
+    - clevis
+    - tang
+    - zfs
+    - security
+
+# No hard role dependencies: the role installs its own packages and is
+# designed to be composable alongside (not after) proxmox-install.
+# Callers that need a specific ordering should use include_role in their
+# play tasks section with explicit sequencing.
+dependencies: []

@@ -1,0 +1,29 @@
+---
+# Set to false to make the role a no-op — useful when the role is included
+# unconditionally in an install playbook but encryption is optional per host.
+clevis_encryption_enabled: true
+
+# Name of the ZFS pool that will be created on top of the encrypted devices.
+clevis_pool_name: "data"
+
+# Tang server list.  Must be overridden in group_vars or host_vars.
+# Expected shape (matches encrypt-data-disks inventory convention):
+#   tang_servers:
+#     - url: "https://tang-prod.example.com"
+#       route: internal
+#     - url: "https://tang-star.example.com"
+#       route: external
+# tang_servers is intentionally left undefined here so the role fails loudly
+# if a caller forgets to supply it, rather than silently producing a broken config.
+
+# Ansible Vault password file on the controller, used to encrypt the recovery
+# key that is stored alongside the inventory.
+clevis_vault_password_file: "~/.ansible_vault_pass"
+
+# Set to true to keep /tmp/ansible_luks_key on the remote host after
+# provisioning completes.  Leave false in production.
+clevis_keep_temp_key: false
+
+# Set to true to destroy an existing ZFS pool before (re-)provisioning.
+# This is a destructive flag — see destroy-pool.yml.
+clevis_destroy_existing: false

@@ -67,22 +67,21 @@
 # cryptsetup refresh re-applies flags to an open dm-crypt device without
 # interrupting I/O or closing the mapper.  It is safe to call on a live
 # production system with active ZFS workloads.
-
-- name: "{{ disk_device }}: check if LUKS mapper is currently open"
-  ansible.builtin.stat:
-    path: "/dev/mapper/crypt-{{ disk_device }}"
-  register: _mapper_stat
+#
+# Note: ansible.builtin.stat misreports symlinks-to-block-devices in
+# /dev/mapper/ as absent, so we use 'cryptsetup status' (rc=0 if open,
+# non-zero if not) to determine whether the mapper is currently active.
 
 - name: "{{ disk_device }}: read active flags from running mapper"
   # 'cryptsetup status' reports the live dm-crypt device flags (e.g. 'discards')
-  # for the currently open mapper.  This is distinct from 'luksDump', which reads
-  # the LUKS header on the underlying block device and does not reflect what
-  # flags are active on the running mapping.
+  # for the currently open mapper.  rc=0 means the device is active; non-zero
+  # means it is not open (device absent or not yet unlocked).
+  # check_mode: false — read-only probe, safe to run unconditionally.
   ansible.builtin.command: cryptsetup status "crypt-{{ disk_device }}"
   register: _mapper_status
   changed_when: false
   failed_when: false
-  when: _mapper_stat.stat.exists
+  check_mode: false
 
 - name: "{{ disk_device }}: apply discard passthrough to running mapper"
   # --token-only: re-authorizes using the existing LUKS2 Clevis/Tang token.
@@ -95,7 +94,6 @@
   ansible.builtin.command: >
     cryptsetup refresh --token-only --allow-discards crypt-{{ disk_device }}
   when:
-    - _mapper_stat.stat.exists
-    - _mapper_status.stdout is defined
+    - _mapper_status.rc == 0
     - "'discards' not in _mapper_status.stdout"
   changed_when: true

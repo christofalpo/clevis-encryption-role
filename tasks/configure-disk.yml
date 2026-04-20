@@ -95,7 +95,11 @@
   #   crypttab.  Defense in depth alongside the crypttab discard option.
   #   LUKS2 only — all disks provisioned by this role use LUKS2.
   # Idempotent: skipped if 'discards' is already listed in the active flags.
-  ansible.builtin.command: >
+  # ansible.builtin.shell rather than command: the Clevis token handler is a
+  # shell script that calls jose/curl; the stripped PATH in ansible.builtin.command
+  # causes silent rc=1 failures even though the same command works as root in an
+  # interactive session.  shell runs via /bin/sh -c and inherits a complete PATH.
+  ansible.builtin.shell: >
     cryptsetup refresh --token-only --allow-discards --persistent crypt-{{ disk_device }}
   when:
     - _mapper_status.rc == 0

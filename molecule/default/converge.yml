@@ -1,0 +1,22 @@
+---
+# Applies the clevis-encryption role to the container instance.
+#
+# The provisioning block is automatically skipped because:
+#   - prepare.yml already wrote /tmp/molecule_recovery_key.txt
+#   - clevis_recovery_key_path points there via host_vars in molecule.yml
+#   - the stat task finds the file exists, so clevis_recovery_key_stat.stat.exists = true
+#
+# Only the boot-ordering block runs, which is what we want to test:
+#   - /etc/crypttab entry for loop0
+#   - live discard passthrough on the open crypt-loop0 mapper
+#   - gai.conf IPv4 precedence block (clevis_ipv4_only=true)
+#   - clevis-network-ready.service deployed and enabled
+#   - clevis-luks-askpass drop-ins
+
+- name: "Converge"
+  hosts: all
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: clevis-encryption

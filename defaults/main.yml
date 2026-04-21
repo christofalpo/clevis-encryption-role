@@ -58,6 +58,18 @@ clevis_register_proxmox_storage: false
 #     - "10.20.20.2"
 clevis_dns_servers: []
 
+# ── Recovery key path ─────────────────────────────────────────────────────────
+# Path on the Ansible controller where the vault-encrypted LUKS recovery key is
+# stored after a successful provisioning run.  The default follows the standard
+# Ansible host_vars layout relative to the inventory directory.
+#
+# Override this when the role is used outside the standard inventory layout, or
+# when you want to store secrets in a separate secrets directory.
+#
+# Example (flat secrets dir alongside playbook):
+#   clevis_recovery_key_path: "{{ playbook_dir }}/secrets/{{ inventory_hostname }}/luks_recovery_key.txt"
+clevis_recovery_key_path: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets/luks_recovery_key.txt"
+
 # Set to true to prefer IPv4 over IPv6 for all getaddrinfo() calls on the
 # host and to gate clevis-luks-askpass.service on that preference being
 # confirmed at boot.

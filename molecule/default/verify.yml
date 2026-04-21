@@ -1,0 +1,94 @@
+---
+# Verifies the expected post-convergence state.
+#
+# Checks:
+#   1. /etc/crypttab contains the correct entry for loop0
+#   2. /dev/mapper/crypt-loop0 is present (mapper is open and discards active)
+#   3. gai.conf contains both IPv4 precedence lines (clevis_ipv4_only=true)
+#   4. clevis-network-ready.service unit file is deployed
+#   5. clevis-luks-askpass.service.d/ipv4-only.conf is deployed
+#   6. clevis-luks-askpass.service.d/network-online.conf is deployed
+
+- name: "Verify"
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: "Read /etc/crypttab"
+      ansible.builtin.slurp:
+        src: /etc/crypttab
+      register: _crypttab
+
+    - name: "Assert crypttab contains crypt-loop0 with correct flags"
+      ansible.builtin.assert:
+        that:
+          - "'crypt-loop0' in (_crypttab.content | b64decode)"
+          - "'_netdev' in (_crypttab.content | b64decode)"
+          - "'x-systemd.after=network-online.target' in (_crypttab.content | b64decode)"
+          - "'discard' in (_crypttab.content | b64decode)"
+          - "'nofail' in (_crypttab.content | b64decode)"
+        fail_msg: "/etc/crypttab does not have the expected crypt-loop0 entry"
+
+    - name: "Assert /dev/mapper/crypt-loop0 exists"
+      ansible.builtin.stat:
+        path: /dev/mapper/crypt-loop0
+      register: _mapper
+
+    - name: "Fail if mapper device is absent"
+      ansible.builtin.assert:
+        that: _mapper.stat.exists
+        fail_msg: "/dev/mapper/crypt-loop0 is not present — LUKS device was not opened"
+
+    - name: "Assert cryptsetup status shows discards enabled"
+      ansible.builtin.command: cryptsetup status crypt-loop0
+      register: _cs_status
+      changed_when: false
+
+    - name: "Fail if discards not active on mapper"
+      ansible.builtin.assert:
+        that: "'discards' in _cs_status.stdout"
+        fail_msg: "discards flag is not active on crypt-loop0"
+
+    - name: "Read /etc/gai.conf"
+      ansible.builtin.slurp:
+        src: /etc/gai.conf
+      register: _gai
+
+    - name: "Assert gai.conf contains both IPv4 precedence lines"
+      ansible.builtin.assert:
+        that:
+          - "'precedence ::ffff:0:0/96' in (_gai.content | b64decode)"
+          - "'precedence ::/0' in (_gai.content | b64decode)"
+        fail_msg: "/etc/gai.conf is missing the IPv4 precedence block"
+
+    - name: "Assert clevis-network-ready.service is deployed"
+      ansible.builtin.stat:
+        path: /etc/systemd/system/clevis-network-ready.service
+      register: _cnr
+
+    - name: "Fail if clevis-network-ready.service is absent"
+      ansible.builtin.assert:
+        that: _cnr.stat.exists
+        fail_msg: "clevis-network-ready.service was not deployed"
+
+    - name: "Assert ipv4-only drop-in is deployed"
+      ansible.builtin.stat:
+        path: /etc/systemd/system/clevis-luks-askpass.service.d/ipv4-only.conf
+      register: _ipv4dropin
+
+    - name: "Fail if ipv4-only.conf drop-in is absent"
+      ansible.builtin.assert:
+        that: _ipv4dropin.stat.exists
+        fail_msg: "ipv4-only.conf drop-in was not deployed"
+
+    - name: "Assert network-online drop-in is deployed"
+      ansible.builtin.stat:
+        path: /etc/systemd/system/clevis-luks-askpass.service.d/network-online.conf
+      register: _netdropin
+
+    - name: "Fail if network-online.conf drop-in is absent"
+      ansible.builtin.assert:
+        that: _netdropin.stat.exists
+        fail_msg: "network-online.conf drop-in was not deployed"

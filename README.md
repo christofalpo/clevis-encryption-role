@@ -62,6 +62,7 @@ automation:
 | `clevis_destroy_existing` | `false` | Destroy an existing ZFS pool before (re-)provisioning. **Destructive.** |
 | `clevis_dns_servers` | `[]` | Nameservers to prepend to `/etc/resolv.conf` during provisioning. Useful when Tang is reachable only via an internal DNS zone not in the host's default resolver. Empty = no change. |
 | `clevis_ipv4_only` | `false` | Deploy a systemd gate that verifies IPv6 is disabled before allowing Tang unlock attempts. See [IPv4-only mode](#ipv4-only-mode). |
+| `clevis_recovery_key_path` | `{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets/luks_recovery_key.txt` | Path on the Ansible controller where the vault-encrypted recovery key is stored. Override when using a non-standard inventory layout or a separate secrets directory. |
 
 ### Tang servers
 
@@ -266,6 +267,163 @@ recoverable state.
 | Debian 13 (Trixie) | initramfs-tools | Yes |
 | Ubuntu 22.04+ | initramfs-tools | Likely works, not tested |
 | RHEL / Fedora | dracut | **Not supported** — use `linux-system-roles/nbde_client` |
+
+## Testing
+
+The role ships with a [Molecule](https://ansible.readthedocs.io/projects/molecule/)
+test suite under `molecule/default/`.  It uses the Docker driver with a
+privileged Debian 12 container that has `systemd` as PID 1.
+
+### Prerequisites
+
+```bash
+pip install molecule molecule-plugins[docker] ansible
+```
+
+Docker must be running on the controller.
+
+### Running the tests
+
+```bash
+cd ansible/roles/clevis-encryption
+molecule test
+```
+
+`molecule test` runs the full lifecycle: `create → prepare → converge → verify → destroy`.
+
+To iterate faster during development:
+
+```bash
+molecule converge   # apply role changes to a running instance
+molecule verify     # re-run assertions without re-converging
+molecule destroy    # tear down the container
+```
+
+### What is tested
+
+The test suite focuses on the **boot-ordering block** (always runs, idempotent):
+
+- `/etc/crypttab` contains a correct entry for the loopback device with all
+  required flags (`_netdev`, `x-systemd.after=network-online.target`, `discard`,
+  `nofail`)
+- `/dev/mapper/crypt-loop0` is open and `discards` is active in the dm-crypt table
+- `/etc/gai.conf` contains both IPv4 precedence lines (because `clevis_ipv4_only: true`
+  is set in the test scenario)
+- `clevis-network-ready.service` is deployed
+- `clevis-luks-askpass.service.d/ipv4-only.conf` and `network-online.conf` drop-ins
+  are deployed
+
+The provisioning block (LUKS format, Clevis bind, ZFS pool creation) is skipped
+in the test because `prepare.yml` pre-creates the recovery key file — the same
+mechanism that prevents re-provisioning on live nodes.
+
+### How disk mocking works
+
+The disk discovery task in `tasks/main.yml` carries a
+`when: clevis_raw_disks is not defined` guard.  The Molecule `host_vars` in
+`molecule.yml` pre-set `clevis_raw_disks: [loop0]`, so the task is skipped and
+the role operates on the loopback device rather than trying to inspect
+`ansible_devices` (which is unreliable in containers).
+
+## Troubleshooting
+
+### `cryptsetup refresh --token-only` fails silently (cryptsetup 2.7+)
+
+**Symptom:** The live discard passthrough task exits with rc=1 in under 10 ms, no
+stderr output, and the mapper's `discards` flag is not set.
+
+**Cause:** cryptsetup 2.7+ delegates LUKS2 token handling to shared libraries
+(`/usr/lib/x86_64-linux-gnu/cryptsetup/libcryptsetup-token-<name>.so`).  The
+Clevis token handler (`libcryptsetup-token-clevis.so`) is not packaged for
+Debian as of Bookworm/Trixie.  Without it cryptsetup logs:
+
+```
+Trying to load …/libcryptsetup-token-clevis.so: cannot open shared object file
+No usable token is available.
+```
+
+**Fix:** This role uses `dmsetup suspend/reload/resume` to rewrite the dm-crypt
+kernel device table directly, which does not require any token handler or Tang
+connectivity.  The existing kernel keyring reference is reused as-is.
+
+If you see this error outside of Ansible, confirm the installed cryptsetup
+version with `cryptsetup --version` and check whether
+`libcryptsetup-token-clevis.so` exists under
+`/usr/lib/x86_64-linux-gnu/cryptsetup/`.
+
+---
+
+### Tang connections use IPv6 on dual-stack hosts (`clevis_ipv4_only`)
+
+**Symptom:** Clevis fails to unlock at boot on a dual-stack host.  Manually
+running `clevis luks unlock` or `curl <tang-url>/adv` works only when IPv6 is
+explicitly blocked.
+
+**Cause:** On dual-stack hosts (e.g. Hetzner dedicated servers), `getaddrinfo()`
+returns AAAA records before A records by default.  Even when
+`net.ipv6.conf.all.disable_ipv6=1` is configured in `/etc/sysctl.d/`, the sysctl
+only prevents *new* IPv6 addresses being assigned — addresses already configured
+before `systemd-sysctl.service` ran remain active.  Clevis then attempts Tang
+connections over IPv6, which fails if the Tang server only accepts IPv4 clients.
+
+**Fix:** Set `clevis_ipv4_only: true`.  This writes a two-line `/etc/gai.conf`
+block that explicitly raises IPv4-mapped precedence (100) and lowers native IPv6
+precedence (1), making `getaddrinfo()` return A records first for all
+applications.
+
+```
+precedence ::ffff:0:0/96  100
+precedence ::/0           1
+```
+
+A single `precedence ::ffff:0:0/96  100` line is not sufficient: glibc may
+fall back to a built-in default of 40 for `::/0`, and RFC 6724 Rule 5
+(prefer matching scope/label) can still favour IPv6 before Rule 6 (precedence)
+is reached.  Both lines are required.
+
+**Caveat — `systemd-resolved`:** If the host uses `systemd-resolved` as its
+stub resolver (`/etc/resolv.conf` → `127.0.0.53`), `gai.conf` changes have
+no effect on DNS resolution order.  `systemd-resolved` performs its own RFC 6724
+address sorting and does not consult `/etc/gai.conf`.  In this case the only
+reliable fix is to ensure IPv6 is fully disabled at the kernel level before
+`clevis-luks-askpass.service` starts, or to restrict the Tang DNS record to
+A records only.
+
+---
+
+### `--tags systemd` fails with "clevis_raw_disks is undefined"
+
+**Symptom:** Running `ansible-playbook … --tags systemd` against an already-encrypted
+node fails immediately with an undefined variable error.
+
+**Cause (historical):** The disk discovery `set_fact` task was not tagged with
+`tags: always`, so it was skipped when `--tags systemd` was passed, leaving
+`clevis_raw_disks` undefined for the boot-ordering block.
+
+**Fix:** The task now carries `tags: always` so it runs regardless of which
+tag filter is active.  If you see this error, ensure you are running a recent
+version of this role.
+
+---
+
+### Boot unlock hangs or loops (Tang unreachable)
+
+If Tang is unreachable at boot time:
+
+- The `nofail` crypttab flag allows `remote-cryptsetup.target` to be reached
+  without the disk being unlocked.
+- `ConditionPathExists=/dev/mapper/crypt-<disk>` on the ZFS import drop-ins
+  causes ZFS import to be **skipped** rather than attempting to import a
+  degraded or missing pool.
+- The host boots to `multi-user.target` without ZFS, remaining accessible
+  for operator intervention.
+- To unlock manually after fixing Tang connectivity:
+
+```bash
+clevis luks unlock -d /dev/<device>
+# then import the pool:
+zpool import <pool-name>
+```
 
 ## License
 

@@ -1,0 +1,62 @@
+---
+# Sets up the container environment before the role is applied.
+#
+# What this does:
+#   1. Installs packages needed for LUKS operations and test preparation.
+#   2. Creates a 256 MB loopback file and attaches it as /dev/loop0.
+#   3. Formats /dev/loop0 as LUKS2 using a known passphrase (no Tang needed).
+#   4. Writes a fake recovery key file at the path the role expects, so the
+#      provisioning block is skipped (it is guarded by the key file existing).
+#   5. Opens the LUKS device as crypt-loop0 so the live-discard task has
+#      a running mapper to operate on.
+#
+# Tang is not mocked — the provisioning block is bypassed entirely because the
+# recovery key file pre-exists.  Only the boot-ordering block runs.
+
+- name: "Prepare container for clevis-encryption Molecule test"
+  hosts: all
+  gather_facts: false
+  become: true
+
+  tasks:
+
+    - name: "Install test dependencies"
+      ansible.builtin.apt:
+        name:
+          - cryptsetup
+          - dmsetup
+          - util-linux
+          - zfsutils-linux
+        state: present
+        update_cache: true
+
+    - name: "Create 256 MB backing file for loopback LUKS device"
+      ansible.builtin.command: dd if=/dev/zero of=/tmp/luks_test.img bs=1M count=256
+      args:
+        creates: /tmp/luks_test.img
+
+    - name: "Attach backing file as /dev/loop0"
+      ansible.builtin.command: losetup /dev/loop0 /tmp/luks_test.img
+      args:
+        creates: /dev/loop0
+
+    - name: "Format /dev/loop0 as LUKS2 (passphrase: molecule-test)"
+      ansible.builtin.shell: |
+        echo -n "molecule-test" | cryptsetup luksFormat --type luks2 \
+          --batch-mode /dev/loop0 -
+      args:
+        creates: /dev/mapper/crypt-loop0
+
+    - name: "Open LUKS device as crypt-loop0"
+      ansible.builtin.shell: |
+        echo -n "molecule-test" | cryptsetup luksOpen /dev/loop0 crypt-loop0 -
+      args:
+        creates: /dev/mapper/crypt-loop0
+
+    - name: "Create fake recovery key so provisioning block is skipped"
+      ansible.builtin.copy:
+        dest: /tmp/molecule_recovery_key.txt
+        content: "molecule-test-recovery-key\n"
+        mode: '0600'
+      delegate_to: localhost
+      become: false

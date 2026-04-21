@@ -52,7 +52,7 @@
 
     - name: "Check whether recovery key already exists on controller"
       ansible.builtin.stat:
-        path: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets/luks_recovery_key.txt"
+        path: "{{ clevis_recovery_key_path }}"
       register: clevis_recovery_key_stat
       delegate_to: localhost
       become: false
@@ -63,7 +63,11 @@
       # by size and selects the largest group — the data disks.
       # tags: always — this fact is consumed by both the provisioning and
       # systemd blocks; without it the --tags systemd path has no disk list.
+      # when: not defined — allows Molecule (and other test harnesses) to
+      # pre-set clevis_raw_disks via vars without triggering ansible_devices
+      # inspection, which cannot work reliably in a container environment.
       tags: always
+      when: clevis_raw_disks is not defined
       ansible.builtin.set_fact:
         clevis_raw_disks: "{{ (query_logic | from_json | last).disks }}"
       vars:
@@ -98,7 +102,7 @@
         # --- Recovery key -------------------------------------------------------
         - name: "Ensure host secrets directory exists on controller"
           ansible.builtin.file:
-            path: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets"
+            path: "{{ clevis_recovery_key_path | dirname }}"
             state: directory
             mode: '0700'
           delegate_to: localhost
@@ -122,7 +126,7 @@
         - name: "Write clear-text recovery key to controller (pre-vault)"
           ansible.builtin.copy:
             content: "{{ clevis_passphrase }}"
-            dest: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets/luks_recovery_key.txt"
+            dest: "{{ clevis_recovery_key_path }}"
             mode: '0600'
           delegate_to: localhost
           become: false
@@ -131,7 +135,7 @@
         - name: "Vault-encrypt recovery key on controller"
           ansible.builtin.command: >
             ansible-vault encrypt
-            {{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets/luks_recovery_key.txt
+            {{ clevis_recovery_key_path }}
             --vault-password-file {{ clevis_vault_password_file }}
           delegate_to: localhost
           become: false

@@ -69,6 +69,22 @@
       # when: not defined — allows Molecule (and other test harnesses) to
       # pre-set clevis_raw_disks via vars without triggering ansible_devices
       # inspection, which cannot work reliably in a container environment.
+      #
+      # Rejection prefixes:
+      #   loop  — loopback file mounts
+      #   sr    — optical drives
+      #   dm-   — device-mapper synthetic devices
+      #   nbd   — network block devices
+      #   md    — Linux software RAID
+      #   luks- — LUKS mappers (post-open)
+      #   crypt — dm-crypt mappers (post-open)
+      #   zd    — ZFS zvols (block devices backing guest VMs).  Without this
+      #           filter, a single zvol that happens to be larger than the
+      #           physical NVMe drives wins the "largest size group" selection
+      #           and the role silently iterates over the zvol instead of the
+      #           data disks — leaving the real crypttab entries untouched.
+      #   zram  — compressed RAM block devices
+      #   rbd   — Ceph RADOS block devices
       tags: always
       when: clevis_raw_disks is not defined
       ansible.builtin.set_fact:
@@ -78,7 +94,7 @@
           {% set results = [] %}
           {% set filtered = ansible_devices | dict2items
              | selectattr('value.removable', 'equalto', '0')
-             | rejectattr('key', 'match', '^(loop|sr|dm-|nbd|md|luks-|crypt)') | list %}
+             | rejectattr('key', 'match', '^(loop|sr|dm-|nbd|md|luks-|crypt|zd|zram|rbd)') | list %}
           {% for size, items in filtered | groupby('value.size') | sort(attribute='1.0.value.sectors') %}
             {% set total = (items[0].value.sectors | int) * (items[0].value.host_sectorsize | default(512) | int) %}
             {% set _ = results.append({

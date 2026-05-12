@@ -129,8 +129,18 @@ failure rather than a silent unlock loop.
 
 | Tag | What it runs |
 |---|---|
+| `prestage` | Package install + Tang network preconditions (DNS, IPv6 sysctl, gai.conf gate). Idempotent and safe on un-encrypted nodes. Use this to do most of the setup ahead of the destructive LUKS-format step, shortening the actual maintenance window. |
 | `provision` | The provisioning block only (LUKS format, Clevis bind, ZFS pool creation). Skipped automatically if the recovery key already exists on the controller. |
-| `systemd` | The boot ordering block only (crypttab, systemd drop-ins, network gate). Safe to run against already-encrypted live nodes. |
+| `systemd` | The boot ordering block only (crypttab, systemd drop-ins). Safe to run against already-encrypted live nodes. Does NOT re-run prestage — combine with `--tags prestage,systemd` if you also want the network gate re-validated. |
+
+### Pre-staging on fresh nodes
+
+```bash
+# Apply only the safe-on-un-encrypted-nodes work
+ansible-playbook your-playbook.yml --tags prestage
+```
+
+This installs packages and applies network preconditions without touching any disks. Later, run the playbook without tags (or with `--tags provision`) to do the actual LUKS format and Clevis bind during a tighter maintenance window.
 
 ## Idempotency
 

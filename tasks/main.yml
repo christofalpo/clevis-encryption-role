@@ -1,7 +1,13 @@
 ---
 # Entry point for the clevis-encryption role.
 #
-# Orchestrates the full lifecycle in two blocks:
+# Orchestrates the full lifecycle in three phases:
+#
+#   PRESTAGE  (tag: prestage; idempotent and safe on un-encrypted nodes)
+#     Installs encryption packages, applies Tang network preconditions
+#     (DNS, IPv6 sysctl when clevis_ipv4_only=true, gai.conf gate).
+#     Run on its own with --tags prestage to do this work ahead of the
+#     actual encryption window.
 #
 #   BLOCK: provisioning  (when: recovery key does not yet exist on controller)
 #     Generates a DR passphrase, fetches Tang advertisements, formats and
@@ -9,10 +15,10 @@
 #     registers it with Proxmox.  The temporary key is always removed from
 #     the remote host via the block's always: handler, even on failure.
 #
-#   BLOCK: boot ordering  (always runs, idempotent)
+#   BLOCK: boot ordering  (tag: systemd; always runs, idempotent)
 #     Writes /etc/crypttab entries and systemd drop-ins that ensure the
 #     correct unlock → pool-import sequence on every boot.  Safe to run
-#     against already-encrypted nodes.  Tag: systemd
+#     against already-encrypted nodes.
 #
 # Key variables (all have defaults in defaults/main.yml except tang_servers):
 #   clevis_encryption_enabled  — set false to skip the entire role
@@ -31,24 +37,21 @@
   when: clevis_encryption_enabled | default(true) | bool
   block:
 
-    # ── PRE-FLIGHT ──────────────────────────────────────────────────────────
-    # These tasks always run.  They establish the facts and installed state
-    # needed by both the provisioning and boot-ordering blocks.
+    # ── PRESTAGE ────────────────────────────────────────────────────────────
+    # Pre-stageable tasks: package install + Tang network preconditions.
+    # Tagged 'prestage' so the operator can run this work ahead of time on
+    # nodes that haven't yet had disk encryption provisioned, shortening the
+    # maintenance window for the destructive LUKS-format step.
+    # Also runs as part of a full (no-tag) invocation so first-run behaviour
+    # is unchanged.
 
-    - name: "Install required encryption packages"
-      ansible.builtin.apt:
-        name:
-          - clevis
-          - clevis-luks
-          - clevis-systemd
-          - cryptsetup
-          - systemd-cryptsetup
-          - util-linux
-          - clevis-initramfs
-          - zfsutils-linux
-          - zfs-initramfs
-        state: present
-        update_cache: true
+    - name: "Prestage: packages + Tang network preconditions"
+      ansible.builtin.include_tasks: prestage.yml
+      tags: [prestage]
+
+    # ── PRE-FLIGHT ──────────────────────────────────────────────────────────
+    # These tasks always run.  They establish the facts needed by both the
+    # provisioning and boot-ordering blocks.
 
     - name: "Check whether recovery key already exists on controller"
       ansible.builtin.stat:
@@ -140,34 +143,10 @@
           delegate_to: localhost
           become: false
 
-        # --- Network prerequisites for Tang ------------------------------------
-        - name: "Disable IPv6 for Tang provisioning (clevis_ipv4_only=true)"
-          # Only applied when Tang servers are IPv4-only (e.g. Hetzner dual-stack
-          # hosts where the Tang whitelist only accepts IPv4 connections).
-          # When clevis_ipv4_only is false, IPv6 is left untouched — Tang may be
-          # reachable over IPv6 or the host may be a single-stack IPv4 environment
-          # that needs no explicit sysctl gate.
-          ansible.posix.sysctl:
-            name: "{{ item }}"
-            value: '1'
-            sysctl_set: true
-            sysctl_file: /etc/sysctl.d/99-ipv6_disable.conf
-            state: present
-            reload: true
-          loop:
-            - "net.ipv6.conf.default.disable_ipv6"
-            - "net.ipv6.conf.all.disable_ipv6"
-          when: clevis_ipv4_only | default(false) | bool
-
-        - name: "Prepend provisioning nameservers to /etc/resolv.conf"
-          ansible.builtin.lineinfile:
-            path: /etc/resolv.conf
-            line: "nameserver {{ item }}"
-            insertbefore: '^nameserver'
-            firstmatch: true
-            state: present
-          loop: "{{ clevis_dns_servers | shuffle(seed=inventory_hostname) }}"
-          when: clevis_dns_servers | length > 0
+        # Network preconditions for Tang (DNS, IPv6 sysctl, gai.conf gate) are
+        # handled by tasks/prestage.yml above — runs unconditionally on every
+        # full-role invocation, so by the time we reach this point the host is
+        # already configured to talk to the Tang servers correctly.
 
         # --- Tang advertisement fetch and SSS assembly ------------------------
         - name: "Fetch advertisement keys from Tang servers"
@@ -242,15 +221,11 @@
       tags: [systemd]
       block:
 
-        # ── IPv4-only gate (must run before per-disk discard refresh) ──────
-        # network-prereq.yml writes the gai.conf precedence fix that makes
-        # getaddrinfo() prefer IPv4 over IPv6.  It must run before the
-        # configure-disk.yml loop because the live 'cryptsetup refresh
-        # --token-only' in that loop contacts Tang via Clevis — if gai.conf
-        # is not yet in place, getaddrinfo() still resolves Tang hostnames
-        # to IPv6 and the token-only auth fails silently.
-        - name: "Deploy or remove IPv4-only network gate (clevis_ipv4_only)"
-          ansible.builtin.include_tasks: network-prereq.yml
+        # The IPv4-only network gate (gai.conf precedence + clevis-network-ready.service)
+        # is handled by tasks/prestage.yml.  It is NOT re-run from this block;
+        # operators using --tags systemd to re-apply boot ordering on an already-
+        # provisioned node should combine with prestage if they also want the
+        # network gate re-validated:  --tags prestage,systemd
 
         - name: "Configure crypttab and live discard for {{ item }}"
           ansible.builtin.include_tasks: configure-disk.yml

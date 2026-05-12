@@ -1,0 +1,68 @@
+---
+# Pre-stageable tasks: package installation and network preconditions for Tang.
+#
+# All idempotent and safe on un-encrypted nodes — none of these tasks touch
+# LUKS state.  Designed so the heavy provisioning step (LUKS format + Clevis
+# bind) can happen in a tighter maintenance window with most of the setup
+# already in place.
+#
+# Tag: prestage
+#   Run on its own with:
+#     ansible-playbook playbook.yml --tags prestage
+#   Also runs as part of the full role (no tag filter), so a normal first-run
+#   invocation produces the same end state as prestage + (full run later).
+#
+# Idempotency:
+#   - apt: state=present, no-op when packages are already installed
+#   - sysctl: writes /etc/sysctl.d/99-ipv6_disable.conf, reload-on-change only
+#   - lineinfile: insertbefore + firstmatch — line already there is a no-op
+#   - network-prereq.yml: blockinfile and copy modules, both idempotent
+
+- name: "Install required encryption packages"
+  ansible.builtin.apt:
+    name:
+      - clevis
+      - clevis-luks
+      - clevis-systemd
+      - cryptsetup
+      - systemd-cryptsetup
+      - util-linux
+      - clevis-initramfs
+      - zfsutils-linux
+      - zfs-initramfs
+    state: present
+    update_cache: true
+
+- name: "Disable IPv6 for Tang reachability (clevis_ipv4_only=true)"
+  # Only applied when Tang servers are IPv4-only (e.g. Hetzner dual-stack
+  # hosts where the Tang whitelist only accepts IPv4 connections).
+  # When clevis_ipv4_only is false, IPv6 is left untouched — Tang may be
+  # reachable over IPv6 or the host may be a single-stack IPv4 environment
+  # that needs no explicit sysctl gate.
+  ansible.posix.sysctl:
+    name: "{{ item }}"
+    value: '1'
+    sysctl_set: true
+    sysctl_file: /etc/sysctl.d/99-ipv6_disable.conf
+    state: present
+    reload: true
+  loop:
+    - "net.ipv6.conf.default.disable_ipv6"
+    - "net.ipv6.conf.all.disable_ipv6"
+  when: clevis_ipv4_only | default(false) | bool
+
+- name: "Prepend provisioning nameservers to /etc/resolv.conf"
+  ansible.builtin.lineinfile:
+    path: /etc/resolv.conf
+    line: "nameserver {{ item }}"
+    insertbefore: '^nameserver'
+    firstmatch: true
+    state: present
+  loop: "{{ clevis_dns_servers | shuffle(seed=inventory_hostname) }}"
+  when: clevis_dns_servers | length > 0
+
+- name: "Deploy or remove IPv4-only network gate (gai.conf + systemd unit)"
+  # network-prereq.yml writes the gai.conf precedence fix that makes
+  # getaddrinfo() prefer IPv4 over IPv6, plus the clevis-network-ready.service
+  # gate.  Idempotent — deploys when clevis_ipv4_only=true, removes otherwise.
+  ansible.builtin.include_tasks: network-prereq.yml

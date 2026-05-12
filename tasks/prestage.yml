@@ -15,7 +15,8 @@
 # Idempotency:
 #   - apt: state=present, no-op when packages are already installed
 #   - sysctl: writes /etc/sysctl.d/99-ipv6_disable.conf, reload-on-change only
-#   - lineinfile: insertbefore + firstmatch — line already there is a no-op
+#   - blockinfile: managed nameservers live between markers, replaced (not
+#     appended) on changes — fixes the CRLF-in-resolv.conf accumulation bug
 #   - network-prereq.yml: blockinfile and copy modules, both idempotent
 
 - name: "Install required encryption packages"
@@ -51,14 +52,56 @@
     - "net.ipv6.conf.all.disable_ipv6"
   when: clevis_ipv4_only | default(false) | bool
 
-- name: "Prepend provisioning nameservers to /etc/resolv.conf"
+- name: "Detect managed-nameserver block markers in /etc/resolv.conf"
+  # Used by the cleanup step below to decide whether this host still carries
+  # legacy duplicates from before this task switched to blockinfile.
+  # grep -c returns rc=1 on no matches and rc=2 on missing file — both are
+  # treated as "no markers present" via failed_when: false + default('0').
+  ansible.builtin.shell: |
+    grep -c '^# BEGIN ANSIBLE MANAGED clevis-encryption nameservers' /etc/resolv.conf 2>/dev/null
+  register: _ns_block_marker
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: clevis_dns_servers | length > 0
+
+- name: "One-time cleanup: strip pre-existing duplicates of managed nameservers"
+  # The old task used lineinfile per server.  On hosts with CRLF line endings
+  # in /etc/resolv.conf (e.g. those installed by the Hetzner installimage),
+  # lineinfile's exact-match check fails across the trailing \r and a fresh
+  # 'nameserver X.Y.Z.W' line was appended on every run — silently growing
+  # the file each time the playbook executed.
+  #
+  # This task fires ONLY when the new blockinfile marker is not yet present
+  # on the host — i.e. the first run after this fix lands.  It uses lineinfile
+  # state=absent which removes EVERY matching line, not just the first one.
+  # On hosts that have always been clean (or after the fix takes effect),
+  # the marker exists and this step is skipped.
   ansible.builtin.lineinfile:
     path: /etc/resolv.conf
     line: "nameserver {{ item }}"
+    state: absent
+  loop: "{{ clevis_dns_servers }}"
+  when:
+    - clevis_dns_servers | length > 0
+    - (_ns_block_marker.stdout | default('0') | int) == 0
+
+- name: "Insert managed nameservers as a single ANSIBLE-marked block"
+  # blockinfile is naturally idempotent: subsequent runs locate the BEGIN/END
+  # markers and replace the content between them if it has drifted, rather
+  # than appending.  firstmatch: true with insertbefore puts the managed
+  # block ABOVE any pre-existing nameserver lines so our DNS servers are
+  # queried first.  If resolv.conf has no nameserver lines at all, blockinfile
+  # falls back to BOF (beginning of file).
+  ansible.builtin.blockinfile:
+    path: /etc/resolv.conf
+    block: |
+      {% for ns in clevis_dns_servers | shuffle(seed=inventory_hostname) %}
+      nameserver {{ ns }}
+      {% endfor %}
+    marker: "# {mark} ANSIBLE MANAGED clevis-encryption nameservers"
     insertbefore: '^nameserver'
     firstmatch: true
-    state: present
-  loop: "{{ clevis_dns_servers | shuffle(seed=inventory_hostname) }}"
   when: clevis_dns_servers | length > 0
 
 - name: "Deploy or remove IPv4-only network gate (gai.conf + systemd unit)"

@@ -149,11 +149,12 @@
             group: root
             mode: '0600'
 
-        - name: "Provision encryption on {{ item }}"
+        - name: "Provision encryption on each data disk"
           ansible.builtin.include_tasks: provision-disk.yml
           loop: "{{ clevis_raw_disks }}"
           loop_control:
             loop_var: disk_device
+            label: "{{ disk_device }}"
 
         # NOTE: ZFS pool creation is intentionally NOT here.  It lives in the
         # ungated ensure-pool.yml below so the pool is still created on a re-run
@@ -185,11 +186,12 @@
         # provisioned node should combine with prestage if they also want the
         # network gate re-validated:  --tags prestage,systemd
 
-        - name: "Configure crypttab and live discard for {{ item }}"
+        - name: "Configure crypttab and live discard for each data disk"
           ansible.builtin.include_tasks: configure-disk.yml
           loop: "{{ clevis_raw_disks }}"
           loop_control:
             loop_var: disk_device
+            label: "{{ disk_device }}"
 
         # Disk-set systemd drop-ins (clevis-luks-askpass network gate +
         # zfs-import → LUKS-unlock ordering).  Factored out so replace-disk.yml

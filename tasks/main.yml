@@ -208,3 +208,13 @@
       ansible.builtin.include_tasks: ensure-pool.yml
       when: clevis_ensure_pool | default(true) | bool
       tags: [provision, pool]
+
+    # ── POST-INSTALL VALIDATION ──────────────────────────────────────────────
+    # Validate the boot ordering + live pool now, so the run fails loudly here
+    # instead of leaving a node that only reveals the problem after a reboot.
+    - name: "Verify the encrypted-storage boot ordering + live pool"
+      ansible.builtin.include_tasks: verify-boot-ordering.yml
+      when:
+        - clevis_ensure_pool | default(true) | bool
+        - not ansible_check_mode
+      tags: [provision, pool, verify]

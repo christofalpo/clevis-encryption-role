@@ -23,14 +23,13 @@
 # Nothing early (local-fs, zfs-import.target, basic.target) depends on this
 # chain, so there is no cycle.  Idempotent and safe on already-encrypted nodes.
 
-# ── Remove the networking.service early bring-up drop-in ────────────────────
-# An earlier attempt reordered networking.service to bring the network up before
-# sysinit; it was validated to BREAK boot.  Ensure it is absent everywhere.
-- name: "Remove broken networking.service bring-up drop-in (validated to break boot)"
-  ansible.builtin.file:
-    path: /etc/systemd/system/networking.service.d/10-override.conf
-    state: absent
-  notify: "Reload systemd daemon"
+# NOTE: an EARLIER version of this role wrote a networking.service early bring-up
+# drop-in (networking.service.d/10-override.conf) that was validated to BREAK boot.
+# This role no longer writes it. It deliberately does NOT delete it either: a
+# reusable role cannot prove it owns a generically-named drop-in in another
+# service's directory, so removing it could clobber a file a different role or the
+# operator legitimately owns. Revoking the stale file is a CONSUMER concern (only
+# the operator knows a node ran the old version) — see "Upgrade notes" in README.md.
 
 # ── clevis-luks-askpass network gate (belt-and-suspenders) ──────────────────
 - name: "Create systemd drop-in directory for clevis-luks-askpass"

@@ -1,0 +1,32 @@
+#!/bin/bash
+# Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+# Do not edit by hand; regenerated on each role run.
+#
+# Import the encrypted ZFS data pool from the decrypted LUKS mappers, LATE in
+# boot (after clevis-unlock-data has opened them).  Deliberately separate from
+# the stock zfs-import-scan/zfs-import-cache services: those run early (before
+# local-fs.target) and cannot be made to wait for the network without a systemd
+# ordering cycle.  This runs after network-online.target, decoupled from the
+# early zfs-import / zfs-mount / local-fs chain.
+#
+# Stateless (cachefile=none).  Best-effort: a failed import is reported but does
+# NOT fail the unit — encrypted-storage-pool-check is the viability gate that
+# decides whether the barrier is reached.  A degraded mirror imports fine.
+set -uo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+pool="{{ clevis_pool_name }}"
+
+if zpool list "$pool" >/dev/null 2>&1; then
+  echo "encrypted-storage-import: $pool already imported"
+  exit 0
+fi
+
+echo "encrypted-storage-import: importing $pool from /dev/mapper (cachefile=none)"
+if zpool import -d /dev/mapper -o cachefile=none "$pool"; then
+  echo "encrypted-storage-import: $pool imported"
+else
+  echo "encrypted-storage-import: import of $pool FAILED (insufficient devices decrypted?)"
+fi
+
+exit 0

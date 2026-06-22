@@ -1,0 +1,68 @@
+#!/bin/bash
+# Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+# Do not edit by hand; regenerated on each role run.
+#
+# Unlock every crypt-* data disk listed in /etc/crypttab via Clevis/Tang, with
+# retries for transient Tang failures.  This is the FAIL-DEGRADED unlock step:
+# it distinguishes a MISSING BLOCK DEVICE (hardware) from a DECRYPT FAILURE
+# (Tang/key), logs each per device, and ALWAYS exits 0.  A partial set is
+# acceptable here — the subsequent ZFS scan-import plus the pool-health check
+# (encrypted-storage-pool-check.service) decide whether the pool is usable.
+#
+# Driven by clevis-unlock-data.service (after network-online.target).  Because
+# the crypttab entries carry `noauto`, systemd does not auto-decrypt them; this
+# script is the only thing that opens the data mappers.
+set -uo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+RETRIES={{ clevis_unlock_retries | default(6) | int }}
+DELAY={{ clevis_unlock_retry_delay | default(10) | int }}
+ATTEMPT_TIMEOUT={{ clevis_unlock_attempt_timeout | default(30) | int }}
+CRYPTTAB=/etc/crypttab
+
+log() { echo "clevis-unlock-data: $*"; }
+
+[ -r "$CRYPTTAB" ] || { log "no readable $CRYPTTAB; nothing to do"; exit 0; }
+
+# Fields: <mapper-name> <source> <key> <options>
+while read -r name source _; do
+  case "$name" in
+    crypt-*) ;;
+    ''|\#*) continue ;;
+    *) continue ;;
+  esac
+
+  if [ -b "/dev/mapper/$name" ]; then
+    log "$name: already open"
+    continue
+  fi
+
+  # Resolve the backing block device (crypttab source is normally UUID=<uuid>).
+  case "$source" in
+    UUID=*) dev="/dev/disk/by-uuid/${source#UUID=}" ;;
+    *)      dev="$source" ;;
+  esac
+
+  if [ ! -e "$dev" ]; then
+    log "$name: DEVICE MISSING ($source) -- skipping (hardware fault?); pool may import degraded"
+    continue
+  fi
+
+  unlocked=0
+  for attempt in $(seq 1 "$RETRIES"); do
+    if timeout "$ATTEMPT_TIMEOUT" clevis luks unlock -d "$dev" -n "$name"; then
+      log "$name: unlocked (attempt $attempt/$RETRIES)"
+      unlocked=1
+      break
+    fi
+    log "$name: decrypt attempt $attempt/$RETRIES failed; retrying in ${DELAY}s"
+    sleep "$DELAY"
+  done
+
+  if [ "$unlocked" -ne 1 ]; then
+    log "$name: DECRYPT FAILED after $RETRIES attempts -- skipping (Tang unreachable / key mismatch?); pool may import degraded"
+  fi
+done < "$CRYPTTAB"
+
+# Never fail the boot on a partial unlock; pool viability is decided downstream.
+exit 0

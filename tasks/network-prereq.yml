@@ -63,6 +63,8 @@
         group: root
         mode: '0644'
         content: |
+          # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+          # Do not edit by hand; regenerated on each role run.
           [Unit]
           Description=Verify IPv4-is-preferred before Clevis Tang unlock requests
           Documentation=man:gai.conf(5) man:clevis-luks-askpass(8)
@@ -130,6 +132,8 @@
         group: root
         mode: '0644'
         content: |
+          # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+          # Do not edit by hand; regenerated on each role run.
           [Unit]
           # Block unlock attempts until clevis-network-ready has confirmed that
           # the IPv4 preference is in place.

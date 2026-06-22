@@ -299,6 +299,46 @@ recoverable state.
 | Ubuntu 22.04+ | initramfs-tools | Likely works, not tested |
 | RHEL / Fedora | dracut | **Not supported** — use `linux-system-roles/nbde_client` |
 
+## Upgrade notes
+
+### Removed: networking.service early bring-up drop-in
+
+An earlier version of this role wrote `/etc/systemd/system/networking.service.d/10-override.conf`
+to start networking before `sysinit` so Clevis could reach Tang. It was validated
+to **break boot** (a systemd ordering cycle) and has been replaced by the late,
+decoupled unlock chain (`clevis-unlock-data` → `encrypted-storage-import` → …).
+
+This role **no longer writes** that drop-in. It also deliberately does **not
+delete** it: the role cannot prove it owns a generically-named file in another
+service's drop-in directory, and a reusable role must never clobber a file it
+doesn't own.
+
+**If you ran a pre-rework version of this role**, that stale drop-in may still be
+on your nodes and will keep breaking boot. Remove it as a deliberate, one-time
+step from your own playbook/runbook — you have the context to know the file is
+yours. A content-guarded example (removes the file only when it matches what this
+role used to write — the distinctive `After=… ifupdown2-pre.service sysinit.target`
+line — so it never touches an unrelated `10-override.conf`):
+
+```yaml
+- name: "Stat the legacy clevis networking.service drop-in"
+  ansible.builtin.stat:
+    path: /etc/systemd/system/networking.service.d/10-override.conf
+  register: _dropin
+- name: "Read it (only when present)"
+  ansible.builtin.slurp:
+    src: /etc/systemd/system/networking.service.d/10-override.conf
+  register: _dropin_raw
+  when: _dropin.stat.exists
+- name: "Remove only the old clevis-written drop-in"
+  ansible.builtin.file:
+    path: /etc/systemd/system/networking.service.d/10-override.conf
+    state: absent
+  when:
+    - _dropin.stat.exists
+    - "'ifupdown2-pre.service sysinit.target' in (_dropin_raw.content | b64decode)"
+```
+
 ## Testing
 
 The role ships with a [Molecule](https://ansible.readthedocs.io/projects/molecule/)

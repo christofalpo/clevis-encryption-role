@@ -1,0 +1,26 @@
+---
+# Generates an 8-word TitleCase DR passphrase on the controller and stores it
+# as the play-scoped fact clevis_passphrase.  No file is written here — pair
+# with vault-recovery-key.yml to persist it.
+#
+# Reused by generate-recovery-key.yml (first-run provisioning) and
+# rotate-passphrase.yml (which generates the replacement passphrase).
+
+- name: "Generate 8-word DR passphrase (TitleCase, 4-10 chars per word)"
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      grep -E '^[a-z]{4,10}$' /usr/share/dict/words | shuf -n 8 \
+        | awk '{print toupper(substr($0,1,1)) substr($0,2)}' | paste -sd '-'
+    executable: /bin/bash
+  register: clevis_passphrase_raw
+  changed_when: false   # generates the secret but writes nothing on its own
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  no_log: true
+
+- name: "Store passphrase as play-scoped fact"
+  ansible.builtin.set_fact:
+    clevis_passphrase: "{{ clevis_passphrase_raw.stdout }}"
+  no_log: true

@@ -40,6 +40,28 @@ clevis_destroy_existing: false
 #   stripe  — no redundancy; all disks striped (data loss on any single disk).
 clevis_zfs_pool_topology: "mirror"
 
+# ── Pool management ───────────────────────────────────────────────────────────
+# ensure-pool.yml opens the LUKS mappers and creates/imports the ZFS pool when
+# missing.  It runs on every full invocation (outside the recovery-key-gated
+# provisioning block) so the pool is created even on a re-run that skipped
+# provisioning — the fix for "pool never created because an earlier run failed
+# after writing the recovery key".  Set false to skip pool management entirely
+# (used by the Molecule test, which runs in a container with no usable ZFS
+# kernel module).
+clevis_ensure_pool: true
+
+# ── Boot-time unlock (fail-degraded) ──────────────────────────────────────────
+# clevis-unlock-data.service retries Clevis/Tang decryption per disk at boot,
+# distinguishing a missing block device from a decrypt failure, and always
+# continues so the ZFS scan-import + pool-health check decide pool viability.
+# Worst-case added boot delay ≈ retries × (attempt_timeout + retry_delay) ×
+# number_of_disks (only when disks actually fail every attempt); a healthy disk
+# unlocks on the first attempt.  Keep the budget modest so a genuinely-down Tang
+# degrades quickly rather than hanging the boot.
+clevis_unlock_retries: 3
+clevis_unlock_retry_delay: 5
+clevis_unlock_attempt_timeout: 20
+
 # ── Proxmox storage registration ─────────────────────────────────────────────
 # This role intentionally does NOT register the pool with Proxmox.  The role's
 # job ends at "imported ZFS pool".  Proxmox-specific concerns live in

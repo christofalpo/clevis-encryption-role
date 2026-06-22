@@ -1,0 +1,38 @@
+---
+# Idempotently ensures the encrypted ZFS pool exists and is imported.
+#
+# WHY THIS IS SEPARATE FROM THE PROVISIONING BLOCK:
+# main.yml's provisioning block is gated on the recovery key NOT yet existing on
+# the controller.  The recovery key is written early (before pool creation), so
+# if an earlier run failed AFTER writing it but BEFORE creating the pool, every
+# subsequent run skips provisioning — and the pool is never created.  This task
+# runs UNCONDITIONALLY (it is idempotent) so the pool is created regardless.
+#
+# 1. Ensure each crypt-<disk> mapper is open (Tang unlock if boot/systemd has
+#    not already opened it — e.g. on a re-run before the post-install reboot).
+# 2. setup-pool.yml creates + imports the pool (zpool list guard = no-op when it
+#    already exists).
+#
+# Expects: clevis_raw_disks (set in main.yml pre-flight), clevis_pool_name.
+
+- name: "Ensure pool | check which LUKS mappers are currently open"
+  ansible.builtin.command: "cryptsetup status crypt-{{ item }}"
+  loop: "{{ clevis_raw_disks }}"
+  register: _ensure_mapper_status
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Ensure pool | open any closed mapper via Tang (clevis luks unlock)"
+  ansible.builtin.command: >-
+    clevis luks unlock -d /dev/{{ item.item }} -n crypt-{{ item.item }}
+  loop: "{{ _ensure_mapper_status.results }}"
+  loop_control:
+    label: "crypt-{{ item.item }}"
+  when: item.rc != 0
+  changed_when: true
+  environment:
+    PATH: "{{ ansible_env.PATH }}:/usr/bin:/usr/local/bin"
+
+- name: "Ensure pool | create + import the ZFS pool (idempotent)"
+  ansible.builtin.include_tasks: setup-pool.yml

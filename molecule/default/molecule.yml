@@ -49,6 +49,9 @@ provisioner:
         clevis_ipv4_only: true
         clevis_register_proxmox_storage: false
         clevis_vault_password_file: "/dev/null"
+        # Skip ensure-pool: the container has no usable ZFS kernel module, and
+        # this scenario only tests the boot-ordering block.
+        clevis_ensure_pool: false
 
 verifier:
   name: ansible

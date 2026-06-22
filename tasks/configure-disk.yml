@@ -50,9 +50,11 @@
     #                   remote-cryptsetup.target entirely, stripping all network
     #                   ordering and causing 600+ failed tang attempts before the
     #                   link was up).
+    #   noauto        - don't try to decrypt before something (ZFS) specifically
+    #                   calls for it.
     #   nofail        — boot continues even if unlock times out (tang offline).
     #   discard       — passes TRIM/discard through to the NVMe for wear-levelling.
-    line: "crypt-{{ disk_device }} UUID={{ disk_uuid.stdout }} none luks,discard,nofail,_netdev,x-systemd.after=network-online.target"
+    line: "crypt-{{ disk_device }} UUID={{ disk_uuid.stdout }} none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target"
     create: true
     mode: '0600'
     owner: root

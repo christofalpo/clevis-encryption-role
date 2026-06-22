@@ -15,23 +15,8 @@
 #
 # Idempotent: pool creation and pvesm add are guarded by existence checks.
 
-- name: "Apply per-device ZFS import ordering override"
-  # Complements after-luks-unlock.conf (which uses the high-level
-  # remote-cryptsetup.target) with explicit device unit dependencies so
-  # systemd also waits for each individual mapper device to be present.
-  ansible.builtin.blockinfile:
-    path: /etc/systemd/system/zfs-import-cache.service.d/override.conf
-    create: true
-    mode: '0644'
-    block: |
-      [Unit]
-      Wants=remote-cryptsetup.target
-      After=remote-cryptsetup.target
-      {% for disk in clevis_raw_disks %}
-      Wants=dev-mapper-crypt\x2d{{ disk }}.device
-      After=dev-mapper-crypt\x2d{{ disk }}.device
-      {% endfor %}
-  notify: "Reload systemd daemon"
+# Boot-ordering drop-ins (scan import, barrier, daemon gating) are written by
+# boot-ordering-dropins.yml.  This file's job is creating + importing the pool.
 
 - name: "Build ZFS vdev specification from discovered disks"
   # Generates the vdev argument string for zpool create based on
@@ -44,7 +29,11 @@
   #   stripe  → dev0 dev1 dev2 ...                        (no keyword)
   ansible.builtin.set_fact:
     _clevis_vdev_spec: >-
-      {%- set devs = clevis_raw_disks | map('regex_replace', '^(.*)$', '/dev/mapper/crypt-\1') | list -%}
+      {# Prepend the mapper prefix by replacing the start-of-string anchor.
+         Do NOT use a '\1' backreference here: Jinja parses '\1' in a string
+         literal as the octal escape chr(1), not a regex group reference, which
+         produced '/dev/mapper/crypt-\x01' for every disk and broke zpool create. #}
+      {%- set devs = clevis_raw_disks | map('regex_replace', '^', '/dev/mapper/crypt-') | list -%}
       {%- if clevis_zfs_pool_topology == 'mirror' -%}
         {%- set vdevs = [] -%}
         {%- for i in range(0, devs | length, 2) -%}
@@ -70,10 +59,20 @@
   changed_when: true
   when: clevis_pool_exists.rc != 0
 
-- name: "Enable ZFS cachefile for pool: {{ clevis_pool_name }}"
-  ansible.builtin.command: "zpool set cachefile=/etc/zfs/zpool.cache {{ clevis_pool_name }}"
+- name: "Read current ZFS cachefile property: {{ clevis_pool_name }}"
+  # Scan-based import is stateless (boot-ordering-dropins.yml runs
+  # `zpool import -d /dev/mapper -o cachefile=none`).  A populated zpool.cache
+  # would let zfs-import-cache short-circuit the ordered scan, so disable it.
+  # Run always (not only on create) so existing pools migrate off the cache.
+  ansible.builtin.command: "zpool get -H -o value cachefile {{ clevis_pool_name }}"
+  register: _clevis_cachefile
+  changed_when: false
+  check_mode: false
+
+- name: "Disable ZFS cachefile (stateless scan import): {{ clevis_pool_name }}"
+  ansible.builtin.command: "zpool set cachefile=none {{ clevis_pool_name }}"
   changed_when: true
-  when: clevis_pool_exists.rc != 0
+  when: (_clevis_cachefile.stdout | trim) != 'none'
 
 # Note: Proxmox storage registration is intentionally NOT part of this role.
 # The role's job ends with an imported ZFS pool.  The Proxmox-side

@@ -1,0 +1,33 @@
+---
+# Fetches Tang server advertisements and assembles the Clevis SSS configuration
+# (t=1 of N) into the fact tang_sss_cfg.  Reused by main.yml (first-run
+# provisioning), replace-disk.yml (binding the replacement disk), and
+# rotate-passphrase.yml (clevis re-bind).
+#
+# Expects: tang_servers — list of {url, route} dicts.
+
+- name: "Fetch advertisement keys from Tang servers"
+  ansible.builtin.uri:
+    url: "{{ item }}/adv"
+    return_content: true
+    status_code: 200
+    body_format: json
+  loop: "{{ tang_servers | map(attribute='url') }}"
+  register: clevis_tang_adv
+  until: clevis_tang_adv is not failed
+  retries: 3
+  delay: 5
+  check_mode: false
+
+- name: "Assemble Clevis SSS configuration (t=1 of N)"
+  ansible.builtin.set_fact:
+    tang_sss_cfg: >-
+      {%- set tang_list = [] -%}
+      {%- for resp in clevis_tang_adv.results -%}
+        {%- set _ = tang_list.append({'url': resp.item, 'adv': (resp.content | from_json)}) -%}
+      {%- endfor -%}
+      {{ {'t': 1, 'pins': {'tang': tang_list}} | to_json }}
+
+- name: "Show assembled SSS config"
+  ansible.builtin.debug:
+    var: tang_sss_cfg

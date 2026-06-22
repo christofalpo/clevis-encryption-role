@@ -1,0 +1,212 @@
+---
+# Disk-SET systemd boot ordering for the encrypted ZFS pool.  Factored out of
+# main.yml so replace-disk.yml can refresh it after the disk set changes.
+#
+# FAIL-DEGRADED, and DECOUPLED from the stock early zfs-import machinery.
+#
+# The stock zfs-import-scan/zfs-import-cache services run EARLY (ordered Before
+# zfs-import.target -> zfs-mount.service -> local-fs.target).  Making them wait
+# for the network (needed for Clevis/Tang) creates a systemd ordering cycle
+# (local-fs -> zfs-mount -> zfs-import -> [our net dep] -> network-online ->
+# networking -> local-fs).  systemd breaks such a cycle by DELETING a job — in
+# practice it deleted clevis-unlock-data, so nothing decrypted and no pool came
+# up.  So we DO NOT touch zfs-import-scan; the encrypted data pool is handled by
+# a self-contained LATE chain that only multi-user.target / pvestatd pull in:
+#
+#   network-online.target
+#     -> clevis-unlock-data.service        retry Tang per disk; MISSING DEVICE vs
+#                                          DECRYPT FAILURE; always exit 0
+#     -> encrypted-storage-import.service  zpool import -d /dev/mapper cachefile=none
+#     -> encrypted-storage-pool-check.svc  health ONLINE|DEGRADED -> ok, else fail
+#     -> encrypted-storage-ready.target    the barrier (pvestatd/pve-guests gate on it)
+#
+# Nothing early (local-fs, zfs-import.target, basic.target) depends on this
+# chain, so there is no cycle.  Idempotent and safe on already-encrypted nodes.
+
+# NOTE: an EARLIER version of this role wrote a networking.service early bring-up
+# drop-in (networking.service.d/10-override.conf) that was validated to BREAK boot.
+# This role no longer writes it. It deliberately does NOT delete it either: a
+# reusable role cannot prove it owns a generically-named drop-in in another
+# service's directory, so removing it could clobber a file a different role or the
+# operator legitimately owns. Revoking the stale file is a CONSUMER concern (only
+# the operator knows a node ran the old version) — see "Upgrade notes" in README.md.
+
+# ── clevis-luks-askpass network gate (belt-and-suspenders) ──────────────────
+- name: "Create systemd drop-in directory for clevis-luks-askpass"
+  ansible.builtin.file:
+    path: /etc/systemd/system/clevis-luks-askpass.service.d
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: "Wait for network-online before clevis-luks-askpass attempts Tang"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/clevis-luks-askpass.service.d/network-online.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
+      [Unit]
+      After=network-online.target
+      Wants=network-online.target
+  notify: "Reload systemd daemon"
+
+# ── 1. Retry-driven, fail-degraded unlock ───────────────────────────────────
+- name: "Deploy fail-degraded Clevis unlock script"
+  ansible.builtin.template:
+    src: clevis-unlock-data.sh.j2
+    dest: /usr/local/sbin/clevis-unlock-data
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: "Deploy clevis-unlock-data.service"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/clevis-unlock-data.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
+      [Unit]
+      Description=Unlock Clevis/Tang LUKS data disks (fail-degraded, with retries)
+      Documentation=file:///usr/local/sbin/clevis-unlock-data
+      After=network-online.target
+      Wants=network-online.target
+      # NOTE: no [Install] and not ordered Before any early target — pulled in by
+      # encrypted-storage-import.service (Requires/After).  Keeping it OUT of
+      # zfs-import.target is what avoids the ordering cycle.
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/clevis-unlock-data
+      TimeoutStartSec={{ (clevis_unlock_retries | int)
+                         * (clevis_unlock_attempt_timeout | int + clevis_unlock_retry_delay | int)
+                         * (clevis_raw_disks | length | int) + 120 }}
+  notify: "Reload systemd daemon"
+
+# ── 2. Late, decoupled pool import ──────────────────────────────────────────
+- name: "Deploy encrypted-storage import script"
+  ansible.builtin.template:
+    src: encrypted-storage-import.sh.j2
+    dest: /usr/local/sbin/encrypted-storage-import
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: "Deploy encrypted-storage-import.service"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/encrypted-storage-import.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
+      [Unit]
+      Description=Import the encrypted ZFS data pool ({{ clevis_pool_name }})
+      Requires=clevis-unlock-data.service
+      After=clevis-unlock-data.service network-online.target
+      # Deliberately NOT Before=zfs-import.target/zfs-mount.service/local-fs.target
+      # — that decoupling is what prevents the ordering cycle.
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/encrypted-storage-import
+  notify: "Reload systemd daemon"
+
+# ── 3. Pool-health viability gate ───────────────────────────────────────────
+- name: "Deploy encrypted-storage pool-health check script"
+  ansible.builtin.template:
+    src: encrypted-storage-pool-check.sh.j2
+    dest: /usr/local/sbin/encrypted-storage-pool-check
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: "Deploy encrypted-storage-pool-check.service"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/encrypted-storage-pool-check.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
+      [Unit]
+      Description=Verify encrypted ZFS pool {{ clevis_pool_name }} imported and usable
+      Requires=encrypted-storage-import.service
+      After=encrypted-storage-import.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      # ONLINE or DEGRADED -> usable; absent / FAULTED / UNAVAIL -> exit 1 so the
+      # barrier is NOT reached and the Proxmox daemons stay stopped.
+      ExecStart=/usr/local/sbin/encrypted-storage-pool-check
+  notify: "Reload systemd daemon"
+
+# ── 4. The synchronization barrier ──────────────────────────────────────────
+- name: "Deploy encrypted-storage-ready.target (synchronization barrier)"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/encrypted-storage-ready.target
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
+      [Unit]
+      Description=Encrypted ZFS Storage Synchronization Barrier
+      Documentation=man:systemd.special(7)
+      Requires=encrypted-storage-pool-check.service
+      After=encrypted-storage-pool-check.service
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: "Reload systemd daemon"
+
+# ── Remove obsolete drop-ins from earlier designs ───────────────────────────
+# The zfs-import-scan override (Requires/After clevis-unlock-data) was the source
+# of the ordering cycle; the cache/@ after-luks-unlock.conf were fail-closed.
+- name: "Remove obsolete ZFS-import boot-ordering drop-ins"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/zfs-import-scan.service.d/override.conf
+    - /etc/systemd/system/zfs-import-cache.service.d/after-luks-unlock.conf
+    - /etc/systemd/system/zfs-import-cache.service.d/override.conf
+    - /etc/systemd/system/zfs-import-scan.service.d/after-luks-unlock.conf
+    - /etc/systemd/system/zfs-import@.service.d/after-luks-unlock.conf
+  notify: "Reload systemd daemon"
+
+# ── Leave the stock zfs-import units at the Proxmox default ─────────────────
+# (cache enabled, scan disabled).  With cachefile=none the data pool is not in
+# the cache, so the early cache import no-ops; our late chain imports it.
+- name: "Restore Proxmox-default ZFS import units"
+  ansible.builtin.systemd:
+    name: "{{ item.unit }}"
+    enabled: "{{ item.enabled }}"
+  loop:
+    - { unit: zfs-import-cache.service, enabled: true }
+    - { unit: zfs-import-scan.service, enabled: false }
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: "Enable the encrypted-storage barrier + clevis-luks-askpass.path"
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+  loop:
+    - encrypted-storage-ready.target
+    - clevis-luks-askpass.path
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: "Flush handlers (daemon_reload) before continuing"
+  ansible.builtin.meta: flush_handlers

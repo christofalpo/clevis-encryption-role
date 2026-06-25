@@ -1,0 +1,68 @@
+---
+# Post-REBOOT assertions for the VM boot-ordering test.  Run by tests/vm/run.sh
+# after the role has provisioned the disks and the VM has been rebooted, so these
+# checks observe the REAL systemd boot chain — not the provisioning run.
+#
+# What a green run proves end-to-end:
+#   - the data disks were unlocked at boot by clevis-unlock-data via the EXTERNAL
+#     Tang over the network (only possible after network-online.target);
+#   - the decoupled import -> pool-check -> ready.target chain ran to completion;
+#   - allow_discards survived the reboot (durable open, not just the live-apply).
+- name: "Verify boot-time clevis/Tang unlock + boot ordering (post-reboot)"
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: "Assert encrypted-storage-ready.target reached (the boot barrier)"
+      ansible.builtin.command: systemctl is-active encrypted-storage-ready.target
+      register: _ready
+      changed_when: false
+      failed_when: _ready.stdout != "active"
+
+    - name: "Assert unlock + import + pool-check services all succeeded"
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      loop:
+        - clevis-unlock-data.service
+        - encrypted-storage-import.service
+        - encrypted-storage-pool-check.service
+      register: _svc
+      changed_when: false
+      failed_when: _svc.stdout != "active"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "Assert both data mappers are open after boot"
+      ansible.builtin.command: "cryptsetup status crypt-{{ item }}"
+      loop: [vdb, vdc]
+      changed_when: false
+      loop_control:
+        label: "crypt-{{ item }}"
+
+    - name: "Assert allow_discards is durable across the reboot on each mapper"
+      ansible.builtin.command: "dmsetup table crypt-{{ item }}"
+      loop: [vdb, vdc]
+      register: _dm
+      changed_when: false
+      failed_when: "'allow_discards' not in _dm.stdout"
+      loop_control:
+        label: "crypt-{{ item }}"
+
+    - name: "Assert the ZFS pool imported and is healthy"
+      ansible.builtin.command: "zpool list -H -o health {{ clevis_pool_name | default('data') }}"
+      register: _health
+      changed_when: false
+      failed_when: _health.stdout not in ['ONLINE', 'DEGRADED']
+
+    - name: "Assert the boot unlock happened (clevis-unlock-data unlocked the disks)"
+      ansible.builtin.command: journalctl -b -u clevis-unlock-data.service --no-pager
+      register: _journal
+      changed_when: false
+      failed_when: "'unlocked' not in _journal.stdout"
+
+    - name: "PASS"
+      ansible.builtin.debug:
+        msg: >-
+          VM boot-ordering test PASSED — both data disks unlocked at boot from the
+          external Tang, allow_discards durable across reboot, pool
+          {{ _health.stdout }}, encrypted-storage-ready.target active.

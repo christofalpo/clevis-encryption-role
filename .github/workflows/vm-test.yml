@@ -1,0 +1,55 @@
+name: vm-boot-ordering
+
+# Tier-2 VM test: provisions the role on a real Debian 13 QEMU/KVM guest, reboots
+# it, and verifies the boot-time clevis/Tang unlock + decoupled import chain.
+# This is the only tier that can prove boot ordering (a container cannot reboot
+# through systemd's real target graph).
+#
+# Runs on GitHub-hosted ubuntu-latest, which exposes /dev/kvm (nested virt).
+# Slow (~10-15 min with KVM) so it is manual + PR-on-relevant-paths, not every push.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'tasks/**'
+      - 'templates/**'
+      - 'defaults/**'
+      - 'handlers/**'
+      - 'tests/vm/**'
+      - '.github/workflows/vm-test.yml'
+
+jobs:
+  vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable unprivileged access to /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-utils genisoimage wamerican wget openssh-client
+          python3 -m pip install --upgrade ansible
+          ansible-galaxy collection install -r requirements.yml
+
+      - name: Run the VM boot-ordering test
+        run: tests/vm/run.sh test
+
+      - name: Upload VM serial + run logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-logs
+          path: |
+            tests/vm/.run/serial.log
+          if-no-files-found: ignore
+          retention-days: 7

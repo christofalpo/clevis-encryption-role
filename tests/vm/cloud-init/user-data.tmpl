@@ -1,0 +1,29 @@
+#cloud-config
+# NoCloud seed for the clevis-encryption boot-ordering VM test.
+# run.sh substitutes __SSH_PUBKEY__ before building the seed ISO.
+#
+# This file does ONLY platform prep that is out of the role's scope: grant the
+# control host SSH access, and make the box able to build + load the ZFS kernel
+# module (enable `contrib`, install the DKMS build chain + matching headers, then
+# install and load ZFS).  The clevis-encryption role itself — clevis install,
+# LUKS format/bind, boot-ordering units — is applied afterwards over SSH by
+# tests/vm/playbook.yml, which is the actual thing under test.
+hostname: clevis-vm
+ssh_pwauth: false
+users:
+  - name: debian
+    groups: [sudo]
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - __SSH_PUBKEY__
+package_update: true
+runcmd:
+  - [ bash, -lc, "set -x;
+      sed -i 's/Components: main/Components: main contrib/' /etc/apt/sources.list.d/debian.sources || true;
+      export DEBIAN_FRONTEND=noninteractive;
+      apt-get update;
+      apt-get install -y build-essential dkms gdisk python3 \"linux-headers-$(uname -r)\";
+      apt-get install -y zfs-dkms zfsutils-linux;
+      (modprobe zfs && echo '=== ZFS-LOADED ===') || echo '=== ZFS-LOAD-FAILED ===';
+      echo '=== VM-PREP-DONE ==='" ]

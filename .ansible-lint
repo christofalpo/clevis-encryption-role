@@ -10,3 +10,4 @@
 exclude_paths:
   - molecule/default/roles/
   - molecule/network/roles/
+  - tests/vm/roles/

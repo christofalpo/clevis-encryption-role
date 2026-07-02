@@ -1,13 +1,13 @@
 #cloud-config
-# NoCloud seed for the clevis-encryption boot-ordering VM test.
+# NoCloud seed for the clevis-encryption NBDE VM smoke test.
 # run.sh substitutes __SSH_PUBKEY__ before building the seed ISO.
 #
 # This file does ONLY platform prep that is out of the role's scope: grant the
-# control host SSH access, and make the box able to build + load the ZFS kernel
-# module (enable `contrib`, install the DKMS build chain + matching headers, then
-# install and load ZFS).  The clevis-encryption role itself — clevis install,
-# LUKS format/bind, boot-ordering units — is applied afterwards over SSH by
-# manual_test/playbook.yml, which is the actual thing under test.
+# control host SSH access and refresh the apt cache. The clevis-encryption role
+# (NBDE) installs its own packages (clevis, cryptsetup) afterwards over SSH via
+# manual_test/playbook.yml, which is the actual thing under test. No ZFS/DKMS
+# build is needed — this role is NBDE-only; storage assembly is a separate
+# consumer role's concern.
 hostname: clevis-vm
 ssh_pwauth: false
 users:
@@ -20,10 +20,6 @@ users:
 package_update: true
 runcmd:
   - [ bash, -lc, "set -x;
-      sed -i 's/Components: main/Components: main contrib/' /etc/apt/sources.list.d/debian.sources || true;
       export DEBIAN_FRONTEND=noninteractive;
       apt-get update;
-      apt-get install -y build-essential dkms gdisk python3 \"linux-headers-$(uname -r)\";
-      apt-get install -y zfs-dkms zfsutils-linux;
-      (modprobe zfs && echo '=== ZFS-LOADED ===') || echo '=== ZFS-LOAD-FAILED ===';
       echo '=== VM-PREP-DONE ==='" ]

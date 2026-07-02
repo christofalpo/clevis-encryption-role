@@ -42,7 +42,7 @@ container runtime, rootless. It is **not** wired into CI; run it by hand.
                     │
    ┌────────────────┴───────────────────────────┐
    │  Debian 13 VM (QEMU/KVM, user-mode net)     │
-   │  /dev/vdb /dev/vdc  ->  LUKS2 -> ZFS mirror │
+   │  /dev/vdb /dev/vdc  ->  LUKS2 (NBDE-unlock) │
    └─────────────────────────────────────────────┘
         ▲ role applied over SSH (boot 1), then reboot, then verify (boot 2)
 ```
@@ -75,17 +75,17 @@ live under `manual_test/.run/` and are gitignored.
 
 ## What it asserts (`verify.yml`, after the reboot)
 
-- `encrypted-storage-ready.target` is **active** (the boot barrier was reached);
-- `clevis-unlock-data`, `encrypted-storage-import`, `encrypted-storage-pool-check`
-  all succeeded;
+- `clevis-luks-unlocked.target` is **active** (the public NBDE seam was reached);
+- `clevis-unlock-data` succeeded;
 - both `crypt-vdb` / `crypt-vdc` mappers are open with **`allow_discards`**
   (durable across the reboot, not just the live-apply);
-- the ZFS pool imported and is `ONLINE`;
 - `clevis-unlock-data` logged a successful unlock (network unlock from the
   external Tang).
 
-These are the same assertions as `molecule/vm/verify.yml` — the two tests are
-kept deliberately equivalent.
+This is an **NBDE-only smoke test** — it proves the unlock + the seam. Assembling
+a storage pool on the unlocked mappers is a downstream consumer's job (see
+`encrypted_storage_pool` / `proxmox_encrypted_storage`); the full cross-role boot
+chain (including a real pool) is covered by `molecule/vm`.
 
 ## Files
 
@@ -94,4 +94,4 @@ kept deliberately equivalent.
 | `run.sh` | Orchestrator: Tang container, VM build/boot, apply role over SSH, reboot, verify, teardown. |
 | `playbook.yml` | The role applied to the VM — also a copy-paste **reference playbook** for real deployments. |
 | `verify.yml` | Post-reboot assertions. |
-| `cloud-init/` | NoCloud seed: SSH access + platform prep so ZFS DKMS can build (out of the role's scope). |
+| `cloud-init/` | NoCloud seed: SSH access + apt refresh (no ZFS/DKMS — this role is NBDE-only). |

@@ -9,7 +9,7 @@
 # Docker container: there is no mknod, no losetup, no loopback hack — the role's
 # configure-disk runs against an actual dm-crypt mapper on a real disk.
 #
-# Scope stays lean and reboot-free: boot ordering, ZFS and the real reboot are
+# Scope stays lean and reboot-free: boot ordering, storage assembly and the reboot are
 # out of scope here — that is the Tier-2 VM test (molecule/vm).  This tier proves
 # only the keyslot/crypttab/cleanup layer, fast, without a reboot.
 dependency:
@@ -73,13 +73,7 @@ provisioner:
         # only, so the probe sees v4 OK / v6 FAIL and deterministically pins ipv4
         # — exercising the real detection path, not just the curlrc write.
         clevis_curl_ip_version: auto
-        clevis_register_proxmox_storage: false
         clevis_vault_password_file: "/dev/null"
-        # ZFS is the higher-level consumer of the LUKS/Clevis devices and is out
-        # of scope for this keyslot tier (Tier-2 covers it).  Skip both the ZFS
-        # package install (prestage) and pool management.
-        clevis_install_zfs_packages: false
-        clevis_ensure_pool: false
 
 scenario:
   # Explicit sequence: omit dependency (collections are installed outside

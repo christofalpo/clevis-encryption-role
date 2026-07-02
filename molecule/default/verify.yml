@@ -75,7 +75,6 @@
       loop:
         - /etc/systemd/system/clevis-network-ready.service
         - /etc/systemd/system/clevis-luks-askpass.service.wants/clevis-network-ready.service
-        - /etc/systemd/system/zfs-import-cache.service.d/override.conf
         - /etc/systemd/system/networking.service.d/10-override.conf
         - /etc/sysctl.d/99-ipv6_disable.conf
       register: _owned
@@ -90,13 +89,13 @@
 
     - name: "Stat the FOREIGN look-alike that must be PRESERVED"
       ansible.builtin.stat:
-        path: /etc/systemd/system/zfs-import-scan.service.d/override.conf
+        path: /etc/systemd/system/clevis-luks-askpass.service.d/ipv4-only.conf
       register: _foreign
 
     - name: "Assert foreign look-alike was preserved (no role signature)"
       ansible.builtin.assert:
         that: _foreign.stat.exists
-        fail_msg: "foreign zfs-import-scan override.conf was wrongly removed — content guard failed"
+        fail_msg: "foreign clevis-luks-askpass ipv4-only.conf was wrongly removed — content guard failed"
 
     - name: "Read /etc/gai.conf"
       ansible.builtin.slurp:

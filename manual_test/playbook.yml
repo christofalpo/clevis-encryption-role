@@ -19,12 +19,13 @@
     # which forwards to the Tang container published on the host loopback.
     tang_servers:
       - url: "http://10.0.2.2:7500"
-    # Two blank data disks -> LUKS2 -> a ZFS mirror.
+    # Two blank data disks -> LUKS2, unlocked at boot (NBDE). Assembling a
+    # pool/filesystem on the crypt-* mappers is a separate consumer role's job
+    # (e.g. encrypted_storage_pool / proxmox_encrypted_storage) — not exercised
+    # by this NBDE smoke test.
     clevis_raw_disks:
       - vdb
       - vdc
-    clevis_pool_name: "data"
-    clevis_zfs_pool_topology: "mirror"
     # Probe IPv4/IPv6 and pin the family that serves a valid advertisement.
     # The test Tang is IPv4-only (slirp), so this resolves to ipv4.
     clevis_curl_ip_version: auto

@@ -36,19 +36,9 @@
     state: present
     update_cache: true
 
-- name: "Install ZFS packages (higher-level consumer of the encrypted devices)"
-  # ZFS is the upper layer that lives on top of the LUKS/Clevis devices, so its
-  # packages are gated separately — see clevis_install_zfs_packages in
-  # defaults/main.yml.  Skipped by the Molecule container test (which validates
-  # only the LUKS/Clevis/Tang layer) and by any host where ZFS is owned by a
-  # different role.  zfs-initramfs pulls zfs-dkms, which compiles the ZFS kernel
-  # module — so this cannot run in a container without matching kernel headers.
-  ansible.builtin.apt:
-    name:
-      - zfsutils-linux
-      - zfs-initramfs
-    state: present
-  when: clevis_install_zfs_packages | default(true) | bool
+# NOTE: this role is NBDE-only — it installs no storage/filesystem packages. The
+# ZFS/btrfs/LVM userland belongs to the downstream storage consumer role
+# (e.g. proxmox_encrypted_storage / encrypted_storage_pool).
 
 # NOTE: the old host-global IPv6 disable (/etc/sysctl.d/99-ipv6_disable.conf) and
 # the gai.conf IPv4-only gate are now removed by tasks/cleanup-legacy.yml, which

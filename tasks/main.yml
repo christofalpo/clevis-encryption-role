@@ -10,10 +10,9 @@
 #     actual encryption window.
 #
 #   BLOCK: provisioning  (when: recovery key does not yet exist on controller)
-#     Generates a DR passphrase, fetches Tang advertisements, formats and
-#     binds all data disks with LUKS2/Clevis, then creates the ZFS pool and
-#     registers it with Proxmox.  The temporary key is always removed from
-#     the remote host via the block's always: handler, even on failure.
+#     Generates a DR passphrase, fetches Tang advertisements, and formats +
+#     binds all data disks with LUKS2/Clevis.  The temporary key is always
+#     removed from the remote host via the block's always: handler, even on failure.
 #
 #   BLOCK: boot ordering  (tag: systemd; always runs, idempotent)
 #     Writes /etc/crypttab entries and systemd drop-ins that ensure the
@@ -22,11 +21,9 @@
 #
 # Key variables (all have defaults in defaults/main.yml except tang_servers):
 #   clevis_encryption_enabled  — set false to skip the entire role
-#   clevis_pool_name           — ZFS pool name
 #   tang_servers               — must be set in group_vars / host_vars
 #   clevis_vault_password_file — vault password file on the controller
 #   clevis_keep_temp_key       — retain /tmp/ansible_luks_key (debug only)
-#   clevis_destroy_existing    — destroy existing pool before provisioning
 
 - name: "Skip: clevis_encryption_enabled is false"
   ansible.builtin.debug:
@@ -143,13 +140,6 @@
         - name: "Fetch Tang advertisements and assemble SSS config"
           ansible.builtin.include_tasks: tang-adv.yml
 
-        # --- Optional pool destruction ----------------------------------------
-        - name: "Destroy existing pool (clevis_destroy_existing=true)"
-          ansible.builtin.include_tasks: destroy-pool.yml
-          when: clevis_destroy_existing | default(false) | bool
-          vars:
-            target_pool: "{{ clevis_pool_name }}"
-
         # --- Disk provisioning ------------------------------------------------
         - name: "Write temporary key file to remote host"
           ansible.builtin.copy:
@@ -166,9 +156,9 @@
             loop_var: disk_device
             label: "{{ disk_device }}"
 
-        # NOTE: ZFS pool creation is intentionally NOT here.  It lives in the
-        # ungated ensure-pool.yml below so the pool is still created on a re-run
-        # that skips this provisioning block (recovery key already written).
+        # NOTE: this role is NBDE-only. Storage pool creation/import lives in a
+        # separate consumer role (e.g. proxmox_encrypted_storage) that orders on
+        # the clevis-luks-unlocked.target this role publishes.
 
       always:
         - name: "Remove temporary key from remote host"
@@ -180,8 +170,9 @@
     # ── BLOCK: BOOT ORDERING ────────────────────────────────────────────────
     # Always runs — idempotent and safe on already-encrypted live systems.
     #
-    # Applies the crypttab entries and systemd drop-ins that ensure disks are
-    # unlocked before ZFS import on every boot.
+    # Applies the crypttab entries and systemd drop-ins that unlock the disks at
+    # boot and publish clevis-luks-unlocked.target for a downstream storage
+    # consumer to order after.
     #
     # Can be run in isolation against an already-encrypted node:
     #   ansible-playbook ... --tags systemd
@@ -203,28 +194,9 @@
             loop_var: disk_device
             label: "{{ disk_device }}"
 
-        # Disk-set systemd drop-ins (clevis-luks-askpass network gate +
-        # zfs-import → LUKS-unlock ordering).  Factored out so replace-disk.yml
-        # can refresh them after the pool's disk set changes.
+        # Systemd drop-ins: the clevis-luks-askpass network gate, the
+        # clevis-unlock-data service, and the public clevis-luks-unlocked.target
+        # seam. Factored out so replace-disk.yml can refresh them after the disk
+        # set changes (the unlock service's timeout scales with the disk count).
         - name: "Write disk-set systemd boot-ordering drop-ins"
           ansible.builtin.include_tasks: boot-ordering-dropins.yml
-
-    # ── ENSURE POOL ─────────────────────────────────────────────────────────
-    # Runs UNCONDITIONALLY (idempotent): opens any closed LUKS mappers and
-    # creates/imports the ZFS pool if missing.  Deliberately outside the
-    # recovery-key-gated provisioning block so the pool is still created on a
-    # re-run that failed earlier after the recovery key was written.
-    - name: "Ensure the encrypted ZFS pool exists"
-      ansible.builtin.include_tasks: ensure-pool.yml
-      when: clevis_ensure_pool | default(true) | bool
-      tags: [provision, pool]
-
-    # ── POST-INSTALL VALIDATION ──────────────────────────────────────────────
-    # Validate the boot ordering + live pool now, so the run fails loudly here
-    # instead of leaving a node that only reveals the problem after a reboot.
-    - name: "Verify the encrypted-storage boot ordering + live pool"
-      ansible.builtin.include_tasks: verify-boot-ordering.yml
-      when:
-        - clevis_ensure_pool | default(true) | bool
-        - not ansible_check_mode
-      tags: [provision, pool, verify]

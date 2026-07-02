@@ -13,7 +13,7 @@
 #      distinctive signature) and FOREIGN look-alikes (same name, no signature) —
 #      so verify.yml can prove cleanup-legacy removes ours and preserves theirs.
 #   5. Writes a fake recovery key so the provisioning block is skipped (only
-#      cleanup + prestage + boot-ordering run; provisioning needs ZFS).
+#      cleanup + prestage + boot-ordering run; provisioning is gated off).
 #
 # The clevis unlock -o / refresh behaviour itself is validated by the vendored
 # files/harness-unlock-o.sh, run from verify.yml against its OWN loop device.
@@ -33,10 +33,8 @@
   tasks:
 
     - name: "Install test dependencies"
-      # NO ZFS here — this tier validates only the LUKS/Clevis/Tang layer on a
-      # real virtio disk.  zfsutils-linux/zfs-initramfs are deliberately omitted
-      # (they would pull zfs-dkms and try to build a kernel module); the role
-      # skips them too via clevis_install_zfs_packages.
+      # This tier validates only the LUKS/Clevis/Tang keyslot layer on a real
+      # virtio disk — no storage/filesystem packages (that is a consumer's job).
       ansible.builtin.apt:
         name:
           - cryptsetup
@@ -169,8 +167,7 @@
         mode: '0755'
       loop:
         - /etc/systemd/system/clevis-luks-askpass.service.wants
-        - /etc/systemd/system/zfs-import-cache.service.d
-        - /etc/systemd/system/zfs-import-scan.service.d
+        - /etc/systemd/system/clevis-luks-askpass.service.d
         - /etc/systemd/system/networking.service.d
 
     - name: "Plant OWNED clevis-network-ready.service (Tier 1: by-name)"
@@ -207,15 +204,6 @@
           precedence ::/0           1
           # END ANSIBLE MANAGED clevis-encryption ipv4-only
 
-    - name: "Plant OWNED zfs-import-cache override.conf (signature: clevis-unlock-data)"
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/zfs-import-cache.service.d/override.conf
-        mode: '0644'
-        content: |
-          [Unit]
-          Requires=clevis-unlock-data.service
-          After=clevis-unlock-data.service
-
     - name: "Plant OWNED networking 10-override.conf (signature: ifupdown2-pre.service sysinit.target)"
       ansible.builtin.copy:
         dest: /etc/systemd/system/networking.service.d/10-override.conf
@@ -232,10 +220,11 @@
           net.ipv6.conf.default.disable_ipv6 = 1
           net.ipv6.conf.all.disable_ipv6 = 1
 
-    # FOREIGN (must be PRESERVED): same name, no role signature/header.
-    - name: "Plant FOREIGN zfs-import-scan override.conf (no signature — must survive)"
+    # FOREIGN (must be PRESERVED): a same-named file at a content-guarded path but
+    # with NO role signature/header, so the content guard must leave it alone.
+    - name: "Plant FOREIGN clevis-luks-askpass ipv4-only.conf (no signature — must survive)"
       ansible.builtin.copy:
-        dest: /etc/systemd/system/zfs-import-scan.service.d/override.conf
+        dest: /etc/systemd/system/clevis-luks-askpass.service.d/ipv4-only.conf
         mode: '0644'
         content: |
           [Service]
@@ -245,7 +234,7 @@
       ansible.builtin.systemd:
         daemon_reload: true
 
-    # ── Skip the provisioning block (it needs ZFS) ───────────────────────────
+    # ── Skip the role's provisioning block (via the recovery-key gate) ────────
     - name: "Create fake recovery key so provisioning block is skipped"
       ansible.builtin.copy:
         dest: /tmp/molecule_recovery_key.txt

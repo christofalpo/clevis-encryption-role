@@ -1,44 +1,25 @@
 ---
-# Disk-SET systemd boot ordering for the encrypted ZFS pool.  Factored out of
-# main.yml so replace-disk.yml can refresh it after the disk set changes.
+# Disk-SET systemd boot ordering for the NBDE unlock. Factored out of main.yml so
+# replace-disk.yml can refresh it after the disk set changes (the unlock service's
+# TimeoutStartSec scales with the disk count).
 #
-# Two halves:
-#   UNLOCK (always) — the NBDE unlock service + the clevis-luks-askpass network
-#     gate + the PUBLIC clevis-luks-unlocked.target seam. clevis always owns these.
-#   STORAGE (clevis_deploy_storage_units, default true) — the ZFS import ->
-#     pool-check -> encrypted-storage-ready.target chain, extracted to
-#     storage-boot-ordering.yml. Set the flag false when a separate storage-pool
-#     role (e.g. proxmox_encrypted_storage) owns those units, so clevis and that
-#     role don't both write the same files.
+# This role is NBDE-only. It deploys:
+#   - the clevis-luks-askpass network-online gate,
+#   - the fail-degraded clevis-unlock-data.service (retries Tang per disk; always
+#     exits 0), which opens the crypt-* mappers in the booted system, and
+#   - the PUBLIC clevis-luks-unlocked.target seam a downstream storage consumer
+#     (e.g. proxmox_encrypted_storage / encrypted_storage_pool) orders after.
 #
-# FAIL-DEGRADED, and DECOUPLED from the stock early zfs-import machinery.
-#
-# The stock zfs-import-scan/zfs-import-cache services run EARLY (ordered Before
-# zfs-import.target -> zfs-mount.service -> local-fs.target).  Making them wait
-# for the network (needed for Clevis/Tang) creates a systemd ordering cycle
-# (local-fs -> zfs-mount -> zfs-import -> [our net dep] -> network-online ->
-# networking -> local-fs).  systemd breaks such a cycle by DELETING a job — in
-# practice it deleted clevis-unlock-data, so nothing decrypted and no pool came
-# up.  So we DO NOT touch zfs-import-scan; the encrypted data pool is handled by
-# a self-contained LATE chain that only multi-user.target / pvestatd pull in:
-#
-#   network-online.target
-#     -> clevis-unlock-data.service        retry Tang per disk; MISSING DEVICE vs
-#                                          DECRYPT FAILURE; always exit 0
-#     -> clevis-luks-unlocked.target       PUBLIC seam (unlock has run)
-#     -> encrypted-storage-import.service  zpool import -d /dev/mapper cachefile=none
-#     -> encrypted-storage-pool-check.svc  health ONLINE|DEGRADED -> ok, else fail
-#     -> encrypted-storage-ready.target    the barrier (pvestatd/pve-guests gate on it)
-#
-# Nothing early (local-fs, zfs-import.target, basic.target) depends on this
-# chain, so there is no cycle.  Idempotent and safe on already-encrypted nodes.
+# The data disks carry `noauto` in crypttab, so systemd-cryptsetup does not open
+# them in early boot; clevis-unlock-data does, after network-online.target. That
+# late, network-ordered unlock is what a consumer's import chain gates on — kept
+# OUT of the early local-fs / zfs-import graph to avoid a systemd ordering cycle.
+# Idempotent and safe on already-encrypted nodes.
 
 # NOTE: an EARLIER version of this role wrote a networking.service early bring-up
 # drop-in (networking.service.d/10-override.conf) that was validated to BREAK boot.
-# This role no longer writes it.  It is now removed by tasks/cleanup-legacy.yml —
-# but CONTENT-GUARDED: because '10-override.conf' is a generic name in another
-# service's drop-in directory, cleanup deletes it only when its content carries
-# this role's distinctive ordering line (or ownership header), never blindly.
+# This role no longer writes it. It is removed by tasks/cleanup-legacy.yml —
+# CONTENT-GUARDED, so a same-named foreign file is never blindly deleted.
 
 # ── clevis-luks-askpass network gate (belt-and-suspenders) ──────────────────
 - name: "Create systemd drop-in directory for clevis-luks-askpass"
@@ -86,9 +67,9 @@
       Documentation=file:///usr/local/sbin/clevis-unlock-data
       After=network-online.target
       Wants=network-online.target
-      # NOTE: no [Install] and not ordered Before any early target — pulled in by
-      # clevis-luks-unlocked.target (Requires/After).  Keeping it OUT of
-      # zfs-import.target is what avoids the ordering cycle.
+      # NOTE: no [Install] and not ordered Before any early target — it is pulled
+      # in by clevis-luks-unlocked.target (Requires/After). Keeping it OUT of the
+      # early zfs-import/local-fs graph is what avoids the ordering cycle.
 
       [Service]
       Type=oneshot
@@ -100,13 +81,11 @@
   notify: "Reload systemd daemon"
 
 # ── 1b. Public unlock sync point (the storage-consumer contract) ─────────────
-# The STABLE name any downstream storage consumer (the ZFS import chain in
-# storage-boot-ordering.yml today; a separate storage-pool role tomorrow) should
-# order After=/Wants= to run after NBDE unlock — so consumers never hard-code the
-# internal clevis-unlock-data.service name.  Reached once the fail-degraded unlock
-# step has RUN (clevis-unlock-data always exits 0; a partial unlock still reaches
-# this target).  "Storage is actually assembled + healthy" is a stronger property
-# owned by the consumer's own barrier (e.g. encrypted-storage-ready).
+# The STABLE name a downstream storage consumer orders After=/Wants= to run after
+# NBDE unlock — so consumers never hard-code the internal clevis-unlock-data
+# .service name. Reached once the fail-degraded unlock step has RUN (a partial
+# unlock still reaches it). "Storage is actually assembled + healthy" is a
+# stronger property owned by the consumer's own barrier.
 - name: "Deploy clevis-luks-unlocked.target (public unlock sync point)"
   ansible.builtin.copy:
     dest: /etc/systemd/system/clevis-luks-unlocked.target
@@ -125,14 +104,6 @@
       [Install]
       WantedBy=multi-user.target
   notify: "Reload systemd daemon"
-
-# ── 2-4. The encrypted-storage import chain (ZFS consumer) ──────────────────
-# Extracted to storage-boot-ordering.yml and gated: skip when a separate
-# storage-pool role owns these units (avoids two roles writing the same files).
-# The UNLOCK half + clevis-luks-unlocked.target above are ALWAYS deployed.
-- name: "Deploy the encrypted-storage import chain (skip when a storage-pool role owns it)"
-  ansible.builtin.include_tasks: storage-boot-ordering.yml
-  when: clevis_deploy_storage_units | default(true) | bool
 
 - name: "Enable the unlock sync point + clevis-luks-askpass.path"
   ansible.builtin.systemd:

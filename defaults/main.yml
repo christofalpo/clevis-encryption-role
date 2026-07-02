@@ -3,9 +3,6 @@
 # unconditionally in an install playbook but encryption is optional per host.
 clevis_encryption_enabled: true
 
-# Name of the ZFS pool that will be created on top of the encrypted devices.
-clevis_pool_name: "data"
-
 # Tang server list.  Must be overridden in group_vars or host_vars.
 # Expected shape (matches encrypt-data-disks inventory convention):
 #   tang_servers:
@@ -24,58 +21,10 @@ clevis_vault_password_file: "~/.ansible_vault_pass"
 # provisioning completes.  Leave false in production.
 clevis_keep_temp_key: false
 
-# Set to true to destroy an existing ZFS pool before (re-)provisioning.
-# This is a destructive flag — see destroy-pool.yml.
-clevis_destroy_existing: false
-
-# ── ZFS pool topology ─────────────────────────────────────────────────────────
-# Controls how discovered data disks are arranged into vdevs.
-# Supported values:
-#   mirror  — pairs of disks become mirror vdevs (e.g. 6 disks → 3 mirrors).
-#             Best for read performance and redundancy.  Requires an even
-#             number of disks.
-#   raidz   — all disks in a single raidz vdev (1 parity disk).
-#   raidz2  — all disks in a single raidz2 vdev (2 parity disks).
-#   raidz3  — all disks in a single raidz3 vdev (3 parity disks).
-#   stripe  — no redundancy; all disks striped (data loss on any single disk).
-clevis_zfs_pool_topology: "mirror"
-
-# ── ZFS layer (packages) ──────────────────────────────────────────────────────
-# Install the ZFS userland + initramfs integration (zfsutils-linux,
-# zfs-initramfs) during prestage.  ZFS is the higher-level consumer of the
-# LUKS+Clevis devices this role provisions, so its packages are a separable
-# concern: set false when another role/base image already owns ZFS, or in
-# environments that cannot build the ZFS kernel module — notably the Molecule
-# container test, which validates only the LUKS/Clevis/Tang layer on a loopback
-# device and never touches zpool.  (Leaving this true is the production default;
-# it does NOT create a pool — that is governed by clevis_ensure_pool below.)
-clevis_install_zfs_packages: true
-
-# ── Pool management ───────────────────────────────────────────────────────────
-# ensure-pool.yml opens the LUKS mappers and creates/imports the ZFS pool when
-# missing.  It runs on every full invocation (outside the recovery-key-gated
-# provisioning block) so the pool is created even on a re-run that skipped
-# provisioning — the fix for "pool never created because an earlier run failed
-# after writing the recovery key".  Set false to skip pool management entirely
-# (used by the Molecule test, which runs in a container with no usable ZFS
-# kernel module).
-clevis_ensure_pool: true
-
-# ── Boot-ordering unit ownership ──────────────────────────────────────────────
-# Whether this role deploys the ZFS import-chain units (encrypted-storage-import
-# / -pool-check / -ready.target, via tasks/storage-boot-ordering.yml).  Default
-# true (self-contained).  Set FALSE when a separate storage-pool role owns those
-# units — e.g. proxmox-install's proxmox_encrypted_storage.  clevis then deploys
-# only the UNLOCK half + the public clevis-luks-unlocked.target seam that the
-# storage role consumes, so the two roles don't both write the same unit files.
-# Transitional during the ZFS-consumer split; the storage half is removed from
-# this role entirely once ZFS no longer lives here.
-clevis_deploy_storage_units: true
-
 # ── Boot-time unlock (fail-degraded) ──────────────────────────────────────────
 # clevis-unlock-data.service retries Clevis/Tang decryption per disk at boot,
 # distinguishing a missing block device from a decrypt failure, and always
-# continues so the ZFS scan-import + pool-health check decide pool viability.
+# continues so a downstream storage consumer's health check can decide viability.
 # Worst-case added boot delay ≈ retries × (attempt_timeout + retry_delay) ×
 # number_of_disks (only when disks actually fail every attempt); a healthy disk
 # unlocks on the first attempt.  Keep the budget modest so a genuinely-down Tang
@@ -90,20 +39,14 @@ clevis_unlock_attempt_timeout: 20
 # systemd-cryptsetup never opens them and the crypttab `discard` option is inert
 # — the mapper only gains allow_discards if it is opened with it here.
 #
-# --allow-discards passes TRIM/discard through dm-crypt to the NVMe (required for
-# ZFS autotrim to reach the device).  dm-crypt workqueue/perf flags
+# --allow-discards passes TRIM/discard through dm-crypt to the NVMe so the storage
+# layer's autotrim/discard can reach the device.  dm-crypt workqueue/perf flags
 # (--perf-no_read_workqueue etc.) are deliberately NOT included by default: they
 # are a storage-tuning concern owned by the proxmox_storage_tuning role.  To make
 # them durable at open too, append them here, e.g.:
 #   clevis_luks_open_options: "--allow-discards --perf-no_read_workqueue --perf-no_write_workqueue"
 # Set to "" to open with no extra options (mapper comes up without discard).
 clevis_luks_open_options: "--allow-discards"
-
-# ── Proxmox storage registration ─────────────────────────────────────────────
-# This role intentionally does NOT register the pool with Proxmox.  The role's
-# job ends at "imported ZFS pool".  Proxmox-specific concerns live in
-# proxmox-install (tasks/register-zfs-storage.yml) so this role stays reusable
-# for any LUKS+ZFS deployment, not just Proxmox.
 
 # ── DNS servers for provisioning ─────────────────────────────────────────────
 # Optional list of nameservers to prepend to /etc/resolv.conf during the

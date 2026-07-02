@@ -6,7 +6,8 @@
 #   - clevis_recovery_key_path points there via host_vars in molecule.yml
 #   - the stat task finds the file exists, so clevis_recovery_key_stat.stat.exists = true
 #
-# cleanup-legacy + prestage + boot-ordering run (provisioning needs ZFS, skipped):
+# cleanup-legacy + prestage + boot-ordering run (provisioning is skipped via the
+# pre-created recovery-key gate):
 #   - cleanup-legacy removes planted OWNED artifacts, preserves FOREIGN ones
 #   - curlrc auto-probe pins --ipv4 (local Tang is IPv4-only)
 #   - /etc/crypttab entry for vdb

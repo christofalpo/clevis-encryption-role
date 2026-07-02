@@ -6,9 +6,9 @@
 # Called from tasks/main.yml inside the boot-ordering block, once per disk via
 # include_tasks loop.  The loop variable is disk_device (bare name, e.g. nvme0n1).
 #
-# Disk-independent systemd drop-ins (clevis-luks-askpass network gate,
-# zfs-import-cache ordering) are written once in main.yml after this loop —
-# they must not live here as they would be applied redundantly for every disk.
+# Disk-independent systemd drop-ins (clevis-luks-askpass network gate, the
+# clevis-unlock-data service + clevis-luks-unlocked.target) are written once in
+# main.yml after this loop — not here, where they would be redundant per disk.
 #
 # Idempotent: lineinfile (with regexp) replaces any existing crypttab entry for
 # this device regardless of its current flags; cryptsetup refresh is only called
@@ -53,8 +53,8 @@
     #                   remote-cryptsetup.target entirely, stripping all network
     #                   ordering and causing 600+ failed tang attempts before the
     #                   link was up).
-    #   noauto        - don't try to decrypt before something (ZFS) specifically
-    #                   calls for it.
+    #   noauto        - don't decrypt in early boot; clevis-unlock-data opens
+    #                   these disks in the booted system, after network-online.
     #   nofail        — boot continues even if unlock times out (tang offline).
     #   discard       — passes TRIM/discard through to the NVMe for wear-levelling.
     line: "crypt-{{ disk_device }} UUID={{ disk_uuid.stdout }} none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target"
@@ -73,7 +73,7 @@
 #
 # cryptsetup refresh re-applies flags to an open dm-crypt device without
 # interrupting I/O or closing the mapper.  It is safe to call on a live
-# production system with active ZFS workloads.
+# production system with active storage workloads.
 #
 # Note: ansible.builtin.stat misreports symlinks-to-block-devices in
 # /dev/mapper/ as absent, so we use 'cryptsetup status' (rc=0 if open,

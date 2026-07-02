@@ -41,7 +41,7 @@ TANG_PORT="${TANG_PORT:-7500}"        # host loopback -> tang container
 TANG_URL_GUEST="http://10.0.2.2:${TANG_PORT}"   # how the guest reaches Tang
 NET="clevis-test-net"; TANG_NAME="clevis-tang"
 SSH_WAIT="${SSH_WAIT:-240}"           # seconds to wait for SSH after a boot
-PREP_WAIT="${PREP_WAIT:-600}"         # seconds to wait for cloud-init (zfs-dkms)
+PREP_WAIT="${PREP_WAIT:-600}"         # seconds to wait for cloud-init prep
 CHAIN_WAIT="${CHAIN_WAIT:-210}"       # seconds to wait for the boot chain to settle post-reboot
 
 RT=""        # container runtime (docker|podman), resolved in deps()
@@ -162,10 +162,8 @@ do_test(){
   qemu_boot
   wait_ssh
 
-  say "waiting for cloud-init platform prep (zfs-dkms build, up to ${PREP_WAIT}s)"
+  say "waiting for cloud-init platform prep (up to ${PREP_WAIT}s)"
   vm_ssh "sudo cloud-init status --wait" || warn "cloud-init status --wait returned non-zero"
-  vm_ssh "lsmod | grep -q zfs && echo 'zfs module loaded' || (sudo modprobe zfs && echo 'zfs modprobed')" \
-    || die "ZFS kernel module not available in the VM (DKMS build failed) — see $SERIAL"
 
   printf 'clevis-vm ansible_host=127.0.0.1 ansible_port=%s ansible_user=debian ansible_ssh_private_key_file=%s ansible_python_interpreter=/usr/bin/python3 ansible_ssh_common_args="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o IdentityAgent=none"\n' \
     "$SSH_PORT" "$KEY" > "$INV"

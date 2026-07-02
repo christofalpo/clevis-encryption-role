@@ -6,8 +6,8 @@
 # retries for transient Tang failures.  This is the FAIL-DEGRADED unlock step:
 # it distinguishes a MISSING BLOCK DEVICE (hardware) from a DECRYPT FAILURE
 # (Tang/key), logs each per device, and ALWAYS exits 0.  A partial set is
-# acceptable here — the subsequent ZFS scan-import plus the pool-health check
-# (encrypted-storage-pool-check.service) decide whether the pool is usable.
+# acceptable here — a downstream storage consumer's assembly + health check
+# decide whether the assembled pool is usable.
 #
 # Driven by clevis-unlock-data.service (after network-online.target).  Because
 # the crypttab entries carry `noauto`, systemd does not auto-decrypt them; this

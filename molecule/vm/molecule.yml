@@ -65,11 +65,8 @@ provisioner:
         # dir (NOT /tmp itself — the role chmods dirname to 0700, which fails on /tmp).
         clevis_recovery_key_path: /tmp/molecule-vm-secrets/recovery-key.txt
         clevis_vault_password_file: /tmp/molecule-vm-secrets/vault-pass
-        # clevis NBDE-ONLY — the consumer owns the pool + storage units.
-        clevis_ensure_pool: false
-        clevis_install_zfs_packages: false
-        clevis_deploy_storage_units: false
-        # encrypted_storage_pool consumer (btrfs raid1 across the two mappers).
+        # clevis is NBDE-only (v2.0.0) — it provisions LUKS + unlock; the consumer
+        # below owns the pool. encrypted_storage_pool consumer (btrfs raid1).
         encrypted_storage_pool_backend: btrfs
         encrypted_storage_pool_name: data
         encrypted_storage_pool_topology: mirror

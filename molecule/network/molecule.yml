@@ -50,10 +50,6 @@ provisioner:
         # Exercise the REAL auto-probe: prepare.yml runs Tang on 127.0.0.1:7500
         # bound to IPv4 only, so the probe sees v4 OK / v6 FAIL and pins ipv4.
         clevis_curl_ip_version: auto
-        # ZFS is the higher-level consumer and out of scope here.
-        clevis_install_zfs_packages: false
-        clevis_ensure_pool: false
-        clevis_register_proxmox_storage: false
         clevis_vault_password_file: "/dev/null"
 
 scenario:

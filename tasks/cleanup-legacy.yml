@@ -73,18 +73,10 @@
 - name: "Cleanup | define content-guarded legacy candidates"
   ansible.builtin.set_fact:
     _clevis_legacy_guarded:
-      # Old ZFS-import ordering drop-ins (the source of the boot ordering cycle).
-      # 'override.conf' is the generic systemctl-edit name → guarding is essential.
-      - path: /etc/systemd/system/zfs-import-cache.service.d/override.conf
-        needles: [clevis-unlock-data, remote-cryptsetup.target]
-      - path: /etc/systemd/system/zfs-import-scan.service.d/override.conf
-        needles: [clevis-unlock-data, remote-cryptsetup.target]
-      - path: /etc/systemd/system/zfs-import-cache.service.d/after-luks-unlock.conf
-        needles: [clevis-unlock-data, remote-cryptsetup.target]
-      - path: /etc/systemd/system/zfs-import-scan.service.d/after-luks-unlock.conf
-        needles: [clevis-unlock-data, remote-cryptsetup.target]
-      - path: /etc/systemd/system/zfs-import@.service.d/after-luks-unlock.conf
-        needles: [clevis-unlock-data, remote-cryptsetup.target]
+      # NOTE: the old zfs-import-* ordering drop-ins are a STORAGE concern and are
+      # now cleaned up by the storage-consumer role (proxmox_encrypted_storage's
+      # cleanup-legacy.yml, guarding on the same historical needles). This NBDE
+      # role no longer touches them.
       # The networking early-bring-up drop-in that was validated to BREAK boot.
       # Previously left for the operator (f580265); now removed automatically but
       # ONLY when its distinctive ordering line proves this role wrote it.

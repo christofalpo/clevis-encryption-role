@@ -1,18 +1,53 @@
 # clevis-encryption
 
-An Ansible role that provisions LUKS2 full-disk encryption on Debian hosts,
+An Ansible role that provisions LUKS2 full-disk encryption on Debian hosts and
 binds the unlock key to one or more Tang servers using Clevis Shamir Secret
-Sharing, and configures the correct systemd boot ordering so encrypted devices
-are unlocked before any dependent service (ZFS, NFS, databases) starts.
+Sharing (Network-Bound Disk Encryption, **NBDE**). It formats and binds the data
+disks, opens them in the booted system after the network is up via a
+fail-degraded `clevis-unlock-data.service`, and publishes a public
+**`clevis-luks-unlocked.target`** systemd seam.
 
-Optionally creates a ZFS pool on top of the encrypted devices.
+The role is **NBDE-only**. It ends at "the LUKS mappers are open and
+`clevis-luks-unlocked.target` has been reached". It does **not** create, import,
+or mount any storage — no ZFS pool, no btrfs, no LVM. Assembling a filesystem on
+top of the unlocked mappers is the job of a **separate downstream consumer role**
+that orders after the seam (see [Storage](#storage-separate-consumer-role)
+below). This split keeps the encryption/unlock layer reusable for any storage
+backend instead of being welded to one.
 
-The role is **storage-vendor-agnostic** — it ends at "imported ZFS pool".
-If you want the pool registered as a Proxmox VE storage backend, do that on
-the consuming side (e.g., `community.proxmox.proxmox_storage` with
-`state: present`).  Earlier versions of this role embedded that call;
-it was removed in 2026-05 so the role stays reusable for any LUKS+ZFS
-deployment, not just Proxmox.
+> **Upgrading from a 1.x that created a ZFS pool?** ZFS pool creation moved to a
+> consumer role in 2.0. See [Upgrade notes → 2.0](#20--zfs-removed).
+
+## Storage (separate consumer role)
+
+This role owns encryption + unlock only. Storage assembly lives in a downstream
+consumer role that composes with it across a single stable systemd seam:
+
+```
+clevis_encryption  (this role, NBDE)   LUKS2 + Clevis/Tang; opens crypt-* mappers
+   └─ publishes  clevis-luks-unlocked.target   ← the seam ("unlock has run")
+        │
+        ▼
+<storage consumer role>                assemble → check → mount the pool
+   └─ publishes  encrypted-storage-ready.target ← the barrier consumers gate on
+```
+
+**The seam contract.** A consumer orders its own units
+`After=`/`Wants= clevis-luks-unlocked.target` (never the internal
+`clevis-unlock-data.service` name), does its `assemble → check` chain against the
+`/dev/mapper/crypt-*` devices, and emits its own
+`encrypted-storage-ready.target` barrier for higher-level services to gate on.
+
+Two consumer roles implement this contract:
+
+| Consumer role | Backend | Where |
+|---|---|---|
+| `encrypted_storage_pool` | generic **btrfs / LVM** (mainline, no DKMS) | <https://github.com/alc-kit/encrypted-storage-pool> |
+| `proxmox_encrypted_storage` | **ZFS** (Proxmox VE) | in the `proxmox-install` repo |
+
+Pick `encrypted_storage_pool` for a generic btrfs/LVM pool; pick
+`proxmox_encrypted_storage` when you want the ZFS-on-LUKS behaviour that earlier
+versions of *this* role provided in-tree.
 
 ## Why this role exists
 
@@ -30,11 +65,12 @@ automation:
   (`noauto,_netdev,x-systemd.after=network-online.target`) — these disks are
   opened in the booted system by a dedicated fail-degraded unlock service, not
   by `systemd-cryptsetup` in early boot
-- A self-contained, network-ordered boot chain (`clevis-unlock-data` →
-  `encrypted-storage-import` → pool-health check → a `…-ready.target` barrier)
-  that imports the encrypted pool *after* the network is up, deliberately
-  **decoupled** from the stock early `zfs-import` units so it cannot form the
-  systemd ordering cycle that would otherwise delete the unlock job
+- A self-contained, network-ordered unlock (`clevis-unlock-data.service`
+  runs *after* `network-online.target`) that publishes a public
+  `clevis-luks-unlocked.target` seam, deliberately **kept out of** the stock
+  early `zfs-import`/`local-fs` graph so a storage consumer can order after the
+  unlock without forming the systemd ordering cycle that would otherwise delete
+  the unlock job (see [How boot unlock works](#how-boot-unlock-works))
 - A clevis-scoped IP-family pin (via a `curlrc`) — the role's primary
   network-handling mechanism — so the Tang `curl` call uses the IPv4/IPv6 family
   that actually serves a valid advertisement on dual-stack hosts
@@ -66,14 +102,8 @@ automation:
 | Variable | Default | Description |
 |---|---|---|
 | `clevis_encryption_enabled` | `true` | Set `false` to skip the entire role. Useful when the role is included unconditionally in a playbook but encryption is not needed on every host. |
-| `clevis_pool_name` | `"data"` | Name of the ZFS pool created on top of the encrypted devices. |
-| `clevis_zfs_pool_topology` | `"mirror"` | Vdev layout. See [ZFS pool topology](#zfs-pool-topology). |
-| `clevis_install_zfs_packages` | `true` | Install the ZFS userland + initramfs integration (`zfsutils-linux`, `zfs-initramfs`) during prestage. ZFS is the higher-level consumer of the LUKS/Clevis devices, so its packages are a separable concern — set `false` when another role/base image already owns ZFS, or in environments that cannot build the ZFS kernel module (e.g. the container test). Does **not** create a pool; that is `clevis_ensure_pool`. |
-| `clevis_ensure_pool` | `true` | Open the LUKS mappers and create/import the ZFS pool (runs on every full invocation, outside the recovery-key gate). Set `false` to skip pool management entirely — e.g. when ZFS is owned elsewhere, or for the container tests. |
-| `clevis_deploy_storage_units` | `true` | Deploy the ZFS import→pool-check→`encrypted-storage-ready.target` chain (`tasks/storage-boot-ordering.yml`). Set `false` when a separate storage-pool role owns those units — clevis then deploys only the unlock half + the public `clevis-luks-unlocked.target` seam that the storage role consumes, so the two roles don't both write the same unit files. Transitional during the ZFS-consumer split. |
 | `clevis_vault_password_file` | `"~/.ansible_vault_pass"` | Path to the Ansible Vault password file on the controller, used to encrypt the per-host recovery key. |
 | `clevis_keep_temp_key` | `false` | Retain `/tmp/ansible_luks_key` on the remote host after provisioning. Leave `false` in production. |
-| `clevis_destroy_existing` | `false` | Destroy an existing ZFS pool before (re-)provisioning. **Destructive.** |
 | `clevis_luks_open_options` | `"--allow-discards"` | Options passed to `cryptsetup open` when `clevis-unlock-data` opens each mapper at boot (`clevis luks unlock -o`). The durable place to enable discard, since the `noauto` data disks ignore the crypttab `discard` option. Append `--perf-no_read_workqueue --perf-no_write_workqueue` to make dm-crypt perf flags durable too; set `""` for none. |
 | `clevis_unlock_retries` | `3` | Boot-time `clevis-unlock-data`: number of Tang unlock attempts per disk before giving up (fail-degraded) and moving on. |
 | `clevis_unlock_retry_delay` | `5` | Seconds to wait between boot-time unlock attempts. |
@@ -85,6 +115,12 @@ automation:
 | `clevis_curl_probe_max_time` | `15` | Per-server total timeout (seconds) for `auto` reachability probing. |
 | `clevis_ipv4_only` | `false` | **Deprecated** — superseded by `clevis_curl_ip_version`. When `true` (and `clevis_curl_ip_version` is left at `auto`) it maps to `clevis_curl_ip_version: ipv4`, with a deprecation warning. |
 | `clevis_recovery_key_path` | `{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets/luks_recovery_key.txt` | Path on the Ansible controller where the vault-encrypted recovery key is stored. Override when using a non-standard inventory layout or a separate secrets directory. |
+
+> **Storage variables live on the consumer role.** Pool name, topology,
+> package install, and "destroy existing" are configured on
+> `encrypted_storage_pool` / `proxmox_encrypted_storage`, not here. The pool
+> variables this role used to carry were removed in 2.0 — see
+> [Upgrade notes → 2.0](#20--zfs-removed) if you have any of them in inventory.
 
 ### Tang servers
 
@@ -105,23 +141,6 @@ The role assembles a Clevis SSS (Shamir Secret Sharing) configuration with
 a single Tang server outage does not prevent boot.  To require more than one
 server to be available simultaneously, you can override `tang_sss_cfg` directly
 with a custom JSON string.
-
-### ZFS pool topology
-
-`clevis_zfs_pool_topology` controls how the auto-discovered data disks are
-arranged into ZFS vdevs:
-
-| Value | Behaviour | Minimum disks |
-|---|---|---|
-| `mirror` | Pairs of disks become mirror vdevs. 6 disks → 3 mirrors. Requires an even number of disks. | 2 |
-| `raidz` | All disks in a single raidz vdev (1 parity). | 3 |
-| `raidz2` | All disks in a single raidz2 vdev (2 parity). | 4 |
-| `raidz3` | All disks in a single raidz3 vdev (3 parity). | 5 |
-| `stripe` | All disks striped with no redundancy. Data loss on any single disk failure. | 1 |
-
-The role auto-discovers data disks by grouping all non-removable, non-virtual
-block devices by size and selecting the largest size group.  This reliably
-selects data disks over the OS/boot disk on typical server hardware.
 
 ### Tang IP family (IPv4 / IPv6)
 
@@ -165,8 +184,8 @@ used `systemd-resolved` (which does its own RFC 6724 sort and never consults
 | Tag | What it runs |
 |---|---|
 | `prestage` | Package install + Tang network preconditions (DNS, IP-family probe + curlrc). Idempotent and safe on un-encrypted nodes. Use this to do most of the setup ahead of the destructive LUKS-format step, shortening the actual maintenance window. |
-| `provision` | The provisioning block only (LUKS format, Clevis bind, ZFS pool creation). Skipped automatically if the recovery key already exists on the controller. |
-| `systemd` | The boot ordering block only (crypttab, systemd drop-ins). Safe to run against already-encrypted live nodes. Does NOT re-run prestage — combine with `--tags prestage,systemd` if you also want the network gate re-validated. |
+| `provision` | The provisioning block only (LUKS format, Clevis bind). Skipped automatically if the recovery key already exists on the controller. |
+| `systemd` | The boot ordering block only (crypttab, systemd drop-ins, the `clevis-luks-unlocked.target` seam). Safe to run against already-encrypted live nodes. Does NOT re-run prestage — combine with `--tags prestage,systemd` if you also want the network gate re-validated. |
 
 ### Pre-staging on fresh nodes
 
@@ -210,12 +229,12 @@ ansible-vault decrypt \
 cryptsetup luksOpen /dev/<device> crypt-<device>
 ```
 
-## Example playbook
+## Example playbooks
 
-### Basic — Tang-only, no ZFS, no Proxmox
+### NBDE only — unlock the disks, no storage assembly
 
 ```yaml
-- name: "Encrypt data disks"
+- name: "Encrypt data disks (NBDE only)"
   hosts: my_servers
   become: true
   gather_facts: true
@@ -230,58 +249,69 @@ cryptsetup luksOpen /dev/<device> crypt-<device>
         name: clevis-encryption
       vars:
         clevis_encryption_enabled: true
-        clevis_zfs_pool_topology: "raidz2"
+        clevis_curl_ip_version: auto   # probe IPv4/IPv6 and pin the working family
         clevis_dns_servers:
           - "192.168.1.1"
 ```
 
-### With ZFS pool, register storage on the caller side
+After this run the `/dev/mapper/crypt-*` mappers are opened at boot and
+`clevis-luks-unlocked.target` is reached — but nothing is assembled on top of
+them. Add a consumer role (below) to get a usable pool.
+
+### Compose with a storage consumer — clevis NBDE + btrfs pool
 
 ```yaml
-- name: "Encrypt data disks; register pool with Proxmox afterwards"
+- name: "Encrypt data disks and assemble a btrfs pool on top"
+  hosts: my_servers
+  become: true
+  gather_facts: true
+
+  vars:
+    tang_servers:
+      - url: "https://tang-prod.example.com"
+      - url: "https://tang-backup.example.com"
+
+  roles:
+    # 1. NBDE: LUKS2 + Clevis/Tang; opens crypt-* and publishes the seam.
+    - role: clevis-encryption
+
+    # 2. Consumer: assembles a btrfs raid1 across the mappers, ordered after
+    #    clevis-luks-unlocked.target, and emits encrypted-storage-ready.target.
+    #    (github.com/alc-kit/encrypted-storage-pool)
+    - role: encrypted_storage_pool
+      vars:
+        encrypted_storage_pool_backend: btrfs
+        encrypted_storage_pool_name: data
+        encrypted_storage_pool_topology: mirror
+        encrypted_storage_pool_devices: [vdb, vdc]
+```
+
+### Compose with a storage consumer — clevis NBDE + ZFS on Proxmox
+
+```yaml
+- name: "Encrypt data disks and create a ZFS pool (Proxmox VE)"
   hosts: new_proxmox_hosts
   become: true
   gather_facts: true
 
-  tasks:
-    - name: "Apply disk encryption"
-      ansible.builtin.include_role:
-        name: clevis-encryption
+  vars:
+    tang_servers:
+      - url: "https://tang-prod.example.com"
+
+  roles:
+    - role: clevis-encryption
+
+    # ZFS-on-LUKS consumer from the proxmox-install repo. Consumes the same seam
+    # and emits encrypted-storage-ready.target.
+    - role: proxmox_encrypted_storage
       vars:
-        clevis_encryption_enabled: "{{ encrypt_data_disks | default(false) }}"
-        clevis_pool_name: "data"
-        clevis_zfs_pool_topology: "mirror"
-
-    - name: "Register the ZFS pool as Proxmox storage"
-      community.proxmox.proxmox_storage:
-        api_host: "{{ ansible_host | default(inventory_hostname) }}"
-        api_user: "{{ proxmox_user }}"
-        api_password: "{{ proxmox_password }}"
-        validate_certs: false
-        name: "{{ clevis_pool_name }}"
-        type: zfspool
-        content: [images, rootdir]
-        zfspool_options:
-          pool: "{{ clevis_pool_name }}"
-          sparse: true
-        state: present
-      delegate_to: localhost
-      become: false
-      when: encrypt_data_disks | default(false) | bool
+        proxmox_encrypted_storage_pool_name: data
+        proxmox_encrypted_storage_topology: mirror
 ```
 
-With the following in `group_vars`:
-
-```yaml
-tang_servers:
-  - url: "https://tang-prod.example.com"
-  - url: "https://tang-backup.example.com"
-
-encrypt_data_disks: true
-clevis_curl_ip_version: auto   # auto-probe IPv4/IPv6 and pin the family that
-                               # serves a valid Tang adv. Set ipv4/ipv6 to force
-                               # one, or dual to leave curl to choose.
-```
+Registering the resulting ZFS pool as a Proxmox VE *storage backend*
+(`community.proxmox.proxmox_storage`) is a further concern owned by the
+`proxmox_encrypted_storage` role / your Proxmox playbook, not by this role.
 
 ### Re-apply boot ordering to existing nodes
 
@@ -290,19 +320,21 @@ ansible-playbook your-playbook.yml --tags systemd
 ```
 
 This is safe to run on live systems.  It rewrites crypttab entries and systemd
-drop-ins without touching the LUKS key slots.
+drop-ins (including the `clevis-luks-unlocked.target` seam) without touching the
+LUKS key slots.
 
 ## How boot unlock works
 
 The data disks carry `noauto` in `/etc/crypttab`, so `systemd-cryptsetup` does
 **not** open them in early boot.  Instead the role installs a self-contained,
-network-ordered chain that runs in the booted system.  It is deliberately
-**decoupled** from the stock early `zfs-import` machinery: ordering the early
-`zfs-import` units after a network-dependent unlock creates a systemd ordering
-cycle (`local-fs → zfs-mount → zfs-import → [net dep] → network-online →
-networking → local-fs`), which systemd breaks by *deleting* a job — in practice
-the unlock job, so nothing decrypts.  Keeping our chain out of that graph avoids
-the cycle:
+network-ordered unlock that runs in the booted system and publishes a public
+sync point.  The unlock is deliberately **kept out of** the stock early
+`zfs-import`/`local-fs` graph: ordering an early filesystem/import unit after a
+network-dependent unlock creates a systemd ordering cycle (`local-fs →
+zfs-mount → zfs-import → [net dep] → network-online → networking → local-fs`),
+which systemd breaks by *deleting* a job — in practice the unlock job, so nothing
+decrypts.  Keeping the unlock chain out of that graph is what lets a downstream
+consumer order **after** the unlock seam without re-introducing the cycle:
 
 ```
 network-online.target
@@ -314,41 +346,35 @@ clevis-unlock-data.service          retries Tang per disk; distinguishes a
         │                            ALWAYS exits 0.  curl reads the role curlrc
         │                            via CURL_HOME, so the pinned IP family is used.
         ▼
-clevis-luks-unlocked.target         PUBLIC sync point — "NBDE unlock has run"
-        │                            (WantedBy=multi-user.target).  Downstream
-        │                            storage consumers order After= THIS, not the
-        │                            internal service name.  Reached even on a
-        │                            partial (fail-degraded) unlock.
+clevis-luks-unlocked.target         ◄── THE SEAM. This role ends here.
+                                    PUBLIC sync point — "NBDE unlock has run"
+                                    (Requires/After clevis-unlock-data.service;
+                                    WantedBy=multi-user.target).  Reached even on
+                                    a partial (fail-degraded) unlock.
+        ┊
+        ┊  (a downstream storage consumer role orders After=/Wants= the seam)
         ▼
-encrypted-storage-import.service    zpool import -d /dev/mapper -o cachefile=none
-        │
-        ▼
-encrypted-storage-pool-check.service  pool health ONLINE|DEGRADED → ok;
-        │                              otherwise exit 1 (barrier NOT reached).
-        ▼
-encrypted-storage-ready.target      synchronization barrier
-                                    (WantedBy=multi-user.target); dependent
-                                    services (e.g. Proxmox pvestatd) gate on it.
+<consumer> assemble → check → encrypted-storage-ready.target
+                                    Owned by encrypted_storage_pool (btrfs/LVM)
+                                    or proxmox_encrypted_storage (ZFS):
+                                    import/assemble the pool, health-check it, and
+                                    emit its own barrier for higher-level services
+                                    (e.g. Proxmox pvestatd) to gate on.
 ```
 
 **Consumer contract.** `clevis-luks-unlocked.target` is the stable, public name a
-downstream storage layer should order after (`After=` / `Wants=`) — it means "the
-NBDE unlock step has run". The role's own ZFS import chain orders on it today; a
-storage-pool role split out of this role will use the same seam, so consumers never
-depend on the internal `clevis-unlock-data.service` name. For "storage is actually
-assembled and healthy" (a stronger property) gate on the consumer's own barrier
-(e.g. `encrypted-storage-ready.target`), not this one.
+downstream storage layer orders after (`After=` / `Wants=`) — it means "the NBDE
+unlock step has run". Consumers never depend on the internal
+`clevis-unlock-data.service` name. For "storage is actually assembled and healthy"
+(a stronger property) gate on the consumer's own barrier
+(`encrypted-storage-ready.target`), not this one.
 
 The unlock is **fail-degraded**: a disk that is missing, or whose Tang is
 unreachable after `clevis_unlock_retries` attempts, is logged and skipped rather
 than hanging the boot.  Combined with the `nofail` crypttab flag, the host always
-boots to a recoverable state — if Tang is down the pool simply does not come up,
-`encrypted-storage-pool-check` fails, and `encrypted-storage-ready.target` is not
-reached, so services gated on it stay stopped until you intervene.
-
-The stock `zfs-import-cache.service` is left at its distro default (enabled);
-with `cachefile=none` the encrypted data pool is not in the cache, so the early
-cache import no-ops and this late chain owns the import.
+boots to a recoverable state — if Tang is down the mappers simply do not open,
+the consumer's health check fails, and its `encrypted-storage-ready.target` is
+not reached, so services gated on it stay stopped until you intervene.
 
 ## Compatibility
 
@@ -360,6 +386,37 @@ cache import no-ops and this late chain owns the import.
 | RHEL / Fedora | dracut | **Not supported** — use `linux-system-roles/nbde_client` |
 
 ## Upgrade notes
+
+### 2.0 — ZFS removed
+
+As of 2.0 this role is **NBDE-only**. Everything to do with creating, importing,
+or ordering a storage pool was removed and moved to a downstream consumer role
+(see [Storage](#storage-separate-consumer-role)). The following variables **no
+longer exist** in this role:
+
+| Removed variable | Where it went |
+|---|---|
+| `clevis_pool_name` | `*_pool_name` on the consumer role |
+| `clevis_zfs_pool_topology` | `*_topology` on the consumer role |
+| `clevis_ensure_pool` | `*_ensure` / `*_ensure_pool` on the consumer role |
+| `clevis_install_zfs_packages` | `*_install_packages` on the consumer role |
+| `clevis_destroy_existing` | `*_destroy_existing` on the consumer role |
+| `clevis_deploy_storage_units` | consumer role always owns its own boot-ordering units |
+
+**What to do:**
+
+- **Proxmox / ZFS users:** add the `proxmox_encrypted_storage` role (in the
+  `proxmox-install` repo) after this one, and move your pool name / topology /
+  package / destroy settings onto its `proxmox_encrypted_storage_*` variables.
+  For continuity it defaults `pool_name`/`topology` from any still-present
+  `clevis_pool_name`/`clevis_zfs_pool_topology`, but set the new names at your
+  convenience.
+- **Generic btrfs/LVM users:** add the `encrypted_storage_pool` role
+  (<https://github.com/alc-kit/encrypted-storage-pool>) after this one.
+- The `encrypted-storage-import`/`-pool-check` units and
+  `encrypted-storage-ready.target` are now created by the consumer role, not this
+  one. This role deploys only the unlock half + the `clevis-luks-unlocked.target`
+  seam.
 
 ### Automatic legacy cleanup
 
@@ -383,9 +440,6 @@ owns. Removals fall into three safety tiers:
    directory. Removed **only** when the file's content carries this role's
    ownership header *or* a distinctive signature it always wrote; a same-named
    foreign file with neither is preserved (and logged).
-   - `zfs-import-{cache,scan}.service.d/{override,after-luks-unlock}.conf` and
-     `zfs-import@.service.d/after-luks-unlock.conf` (old ZFS-import ordering
-     drop-ins — the source of an early boot ordering cycle).
    - `networking.service.d/10-override.conf` (an early bring-up drop-in validated
      to **break boot**; guarded on its distinctive
      `… ifupdown2-pre.service sysinit.target` line).
@@ -394,6 +448,13 @@ owns. Removals fall into three safety tiers:
    - `/etc/sysctl.d/99-ipv6_disable.conf` (host-global IPv6 disable; also resets
      `disable_ipv6` to `0` on the live kernel — a reboot fully restores IPv6
      addressing on interfaces that had it stripped).
+
+> **The old ZFS-import ordering drop-ins moved with ZFS.** Earlier versions of
+> this role wrote `zfs-import-{cache,scan}.service.d/*.conf` and
+> `zfs-import@.service.d/after-luks-unlock.conf` drop-ins (the source of an early
+> boot ordering cycle). Now that ZFS is out of this role, cleanup of those
+> drop-ins is the storage consumer's concern — `proxmox_encrypted_storage`
+> content-guards and removes them. This role no longer touches them.
 
 The host-global IPv4-only gate (tier 2 + the sysctl + `clevis-network-ready`) is
 superseded by the clevis-scoped `curlrc` — see
@@ -417,7 +478,7 @@ stack and run on a KVM-capable runner (or locally):
 |---|---|---|---|
 | 0 | **Repository validation** — `yamllint`, `ansible-lint`, `ansible-core` version syntax-check — **plus** the device-free clevis↔Tang **crypto + IP-family** check | `.yamllint`, `.ansible-lint`, `molecule/network` (`ci.yml`) | any runner (+ Docker for the crypto scenario) |
 | 1 | **LUKS keyslot** — `clevis luks bind`/`unlock -o`, crypttab, durable `allow_discards` | `molecule/default` (`vm-tests.yml`) | **Rootless** libvirt/KVM VM (user in `libvirt` group) |
-| 2 | **Real boot ordering** — boot-time unlock from an external Tang, the decoupled import chain, reboot-durable discard, ZFS on LUKS | `molecule/vm` (`vm-tests.yml`) | **Rootless** libvirt/KVM (two VMs: encrypted host + external Tang) |
+| 2 | **Real boot ordering** — boot-time unlock from an external Tang, the seam, and a downstream consumer assembling a pool across it (reboot-durable) | `molecule/vm` (`vm-tests.yml`) | **Rootless** libvirt/KVM (two VMs: encrypted host + external Tang) |
 
 The `network` scenario (Tier 0) is a
 [Molecule](https://ansible.readthedocs.io/projects/molecule/) scenario on the
@@ -430,10 +491,12 @@ to a LUKS keyslot needs a real block device. The `network` scenario runs the
 **same role** device-free (`clevis_raw_disks: []`), so the network handling — the
 subject of `clevis_curl_ip_version` — is testable anywhere. Boot ordering can only
 be proven by a real boot + reboot, so it lives in the `vm` tier: two VMs on
-Vagrant's NAT network — the encrypted host (`vdb`+`vdc` → LUKS2 → a ZFS mirror)
-and a separate **external** Tang server it unlocks from at boot. Tang is its own
-VM because guest↔guest traffic is pure L2 bridging, whereas guest→host services
-are blocked by the host firewall.
+Vagrant's NAT network — the encrypted host (`vdb`+`vdc` → LUKS2 → mappers) and a
+separate **external** Tang server it unlocks from at boot. Tier 2 pairs this role
+(NBDE only) with the **`encrypted_storage_pool`** consumer (a **btrfs** raid1 —
+mainline, **no ZFS/DKMS**) to prove the seam works end-to-end across a reboot.
+Tang is its own VM because guest↔guest traffic is pure L2 bridging, whereas
+guest→host services are blocked by the host firewall.
 
 A **raw-QEMU fallback** of Tier 2 — no libvirt, no Vagrant, no root (user-mode
 QEMU networking + a Tang container) — lives in [`manual_test/`](manual_test/) for
@@ -473,6 +536,10 @@ ansible-galaxy collection install ansible.posix community.general
 sudo usermod -aG libvirt "$USER"
 ```
 
+The Tier-2 (`vm`) scenario also pulls the `encrypted_storage_pool` consumer role
+into its scenario `roles/` directory (via `molecule/vm/requirements.yml`) so it
+can prove the seam against a real downstream consumer.
+
 Two environment variables are required for the VM tiers (see the note below on why):
 
 ```bash
@@ -508,8 +575,9 @@ export LIBVIRT_DEFAULT_URI=qemu:///system
 # Tier-1 — real virtio-disk LUKS keyslot layer (fast, no reboot)
 molecule test              # the 'default' scenario — no sudo
 
-# Tier-2 — real boot ordering: 2 VMs, ZFS-on-LUKS, provision + REBOOT + verify
-molecule test -s vm        # ~10 min: builds ZFS via DKMS, reboots the guest
+# Tier-2 — real boot ordering: 2 VMs, clevis NBDE + btrfs consumer, provision +
+#          REBOOT + verify (no ZFS, no DKMS)
+molecule test -s vm
 ```
 
 `molecule test` runs the full lifecycle (`create → prepare → converge →
@@ -552,24 +620,28 @@ Two GitHub Actions workflows:
 - a vendored harness proves `clevis luks unlock -o "--allow-discards"` and the
   live-refresh path land `allow_discards`
 
-**`vm`** (real boot ordering, post-reboot):
+**`vm`** (real boot ordering, post-reboot — clevis NBDE + btrfs consumer):
 
 - both `crypt-vdb` / `crypt-vdc` mappers are open after boot with `allow_discards`
   still set (durable across the reboot, not just the live-apply)
-- `clevis-unlock-data`, `encrypted-storage-import`, `encrypted-storage-pool-check`
-  all succeeded and `encrypted-storage-ready.target` is active (the boot barrier)
+- `clevis-luks-unlocked.target` is active and systemd logged "Reached target"
+  this boot — the public NBDE seam
+- the seam ordering held across roles at boot:
+  `clevis-unlock-data.service` ≤ `clevis-luks-unlocked.target` ≤
+  `encrypted-storage-assemble.service` (the consumer ran after the seam)
 - `clevis-unlock-data` logged a successful unlock — the disks were opened at boot
   from the **external** Tang (the `clevis-tang` VM) over the network
-- the ZFS mirror imported and is `ONLINE`
+- the downstream `encrypted_storage_pool` (btrfs) assembled + mounted the pool at
+  `/srv/data`, real I/O round-trips, and `encrypted-storage-ready.target` is
+  active (the consumer's barrier)
 
 In the `network` and `default` scenarios the provisioning block (LUKS format on
-real disks, Clevis bind, ZFS pool creation) is **skipped** because `prepare.yml`
-pre-creates the recovery-key file — the same mechanism that prevents
-re-provisioning on live nodes — and ZFS is out of scope there
-(`clevis_install_zfs_packages: false`, `clevis_ensure_pool: false`).  The `vm`
-scenario is the opposite: `prepare.yml` *removes* the recovery-key gate so the
-role provisions for real — it formats the disks, binds Clevis, builds the ZFS
-mirror, then reboots and verifies the pool imports at boot.
+real disks, Clevis bind) is **skipped** because `prepare.yml` pre-creates the
+recovery-key file — the same mechanism that prevents re-provisioning on live
+nodes.  The `vm` scenario is the opposite: `prepare.yml` *removes* the
+recovery-key gate so the role provisions for real — it formats the disks and
+binds Clevis, then the btrfs consumer assembles the pool, and after a reboot the
+test verifies both the boot-time unlock and the pool come up across the seam.
 
 ### How disk selection works
 
@@ -668,26 +740,27 @@ If Tang is unreachable at boot time:
 - `clevis-unlock-data.service` retries each disk a bounded number of times
   (`clevis_unlock_retries` × `clevis_unlock_attempt_timeout`), logs the failure,
   and exits 0 — the boot is never blocked on it.
-- `encrypted-storage-import.service` still runs; if the pool cannot be imported
-  (or imports FAULTED/UNAVAIL) `encrypted-storage-pool-check.service` exits 1 and
-  `encrypted-storage-ready.target` is **not** reached, so services that gate on
-  it (e.g. Proxmox `pvestatd`) stay stopped rather than running against a missing
-  pool.
+- `clevis-luks-unlocked.target` is still reached (the seam means "the unlock step
+  ran", not "every disk opened"), but the mappers of the failed disks are not
+  open.  The downstream consumer's assemble/check chain then fails its viability
+  gate, so its `encrypted-storage-ready.target` is **not** reached and services
+  that gate on it (e.g. Proxmox `pvestatd`) stay stopped rather than running
+  against a missing pool.
 - The host still boots to `multi-user.target` and remains accessible for operator
   intervention.
 - To unlock manually after fixing Tang connectivity:
 
 ```bash
-# Re-run the role's fail-degraded unlock + import chain:
-systemctl start clevis-unlock-data.service encrypted-storage-import.service
+# Re-run the role's fail-degraded unlock, then let the consumer re-assemble:
+systemctl start clevis-unlock-data.service
+systemctl start clevis-luks-unlocked.target   # (or the consumer's assemble unit)
 
-# …or do it by hand for a single disk:
+# …or open a single disk by hand (pool import/assembly is the consumer's concern):
 clevis luks unlock -d /dev/<device> -n crypt-<device> -o "--allow-discards"
-zpool import -d /dev/mapper <pool-name>
 ```
 
-Inspect what happened with `journalctl -u clevis-unlock-data -u
-encrypted-storage-import -u encrypted-storage-pool-check`.
+Inspect what happened with `journalctl -u clevis-unlock-data
+-u clevis-luks-unlocked.target`.
 
 ## License
 

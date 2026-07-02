@@ -89,6 +89,33 @@
                          * (clevis_raw_disks | length | int) + 120 }}
   notify: "Reload systemd daemon"
 
+# ── 1b. Public unlock sync point (the storage-consumer contract) ─────────────
+# The STABLE name any downstream storage consumer (the ZFS import chain below
+# today; a separate storage-pool role tomorrow) should order After=/Wants= to
+# run after NBDE unlock — so consumers never hard-code the internal
+# clevis-unlock-data.service name.  Reached once the fail-degraded unlock step
+# has RUN (clevis-unlock-data always exits 0; a partial unlock still reaches
+# this target).  "Storage is actually assembled + healthy" is a stronger
+# property owned by the consumer's own barrier (e.g. encrypted-storage-ready).
+- name: "Deploy clevis-luks-unlocked.target (public unlock sync point)"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/clevis-luks-unlocked.target
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
+      [Unit]
+      Description=Clevis/Tang LUKS data disks unlocked (public sync point)
+      Documentation=man:systemd.special(7)
+      Requires=clevis-unlock-data.service
+      After=clevis-unlock-data.service
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: "Reload systemd daemon"
+
 # ── 2. Late, decoupled pool import ──────────────────────────────────────────
 - name: "Deploy encrypted-storage import script"
   ansible.builtin.template:
@@ -110,7 +137,10 @@
       [Unit]
       Description=Import the encrypted ZFS data pool ({{ clevis_pool_name }})
       Requires=clevis-unlock-data.service
-      After=clevis-unlock-data.service network-online.target
+      # Order after the PUBLIC unlock sync point (clevis-luks-unlocked.target),
+      # not just the internal service — this is the seam a split-out storage-pool
+      # role will use verbatim. Keeps the direct service Requires as belt-and-braces.
+      After=clevis-unlock-data.service clevis-luks-unlocked.target network-online.target
       # Deliberately NOT Before=zfs-import.target/zfs-mount.service/local-fs.target
       # — that decoupling is what prevents the ordering cycle.
 
@@ -206,12 +236,13 @@
   when: item.unit in (_zfs_import_units.stdout | default(''))
   ignore_errors: "{{ ansible_check_mode }}"
 
-- name: "Enable the encrypted-storage barrier + clevis-luks-askpass.path"
+- name: "Enable the encrypted-storage barrier + unlock target + askpass.path"
   ansible.builtin.systemd:
     name: "{{ item }}"
     enabled: true
   loop:
     - encrypted-storage-ready.target
+    - clevis-luks-unlocked.target
     - clevis-luks-askpass.path
   ignore_errors: "{{ ansible_check_mode }}"
 

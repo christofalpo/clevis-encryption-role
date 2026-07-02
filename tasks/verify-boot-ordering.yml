@@ -16,6 +16,7 @@
     systemd-analyze verify
     encrypted-storage-ready.target
     clevis-unlock-data.service
+    clevis-luks-unlocked.target
     encrypted-storage-import.service
     encrypted-storage-pool-check.service
   register: _clevis_boot_verify

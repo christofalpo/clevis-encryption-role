@@ -313,6 +313,12 @@ clevis-unlock-data.service          retries Tang per disk; distinguishes a
         │                            ALWAYS exits 0.  curl reads the role curlrc
         │                            via CURL_HOME, so the pinned IP family is used.
         ▼
+clevis-luks-unlocked.target         PUBLIC sync point — "NBDE unlock has run"
+        │                            (WantedBy=multi-user.target).  Downstream
+        │                            storage consumers order After= THIS, not the
+        │                            internal service name.  Reached even on a
+        │                            partial (fail-degraded) unlock.
+        ▼
 encrypted-storage-import.service    zpool import -d /dev/mapper -o cachefile=none
         │
         ▼
@@ -323,6 +329,14 @@ encrypted-storage-ready.target      synchronization barrier
                                     (WantedBy=multi-user.target); dependent
                                     services (e.g. Proxmox pvestatd) gate on it.
 ```
+
+**Consumer contract.** `clevis-luks-unlocked.target` is the stable, public name a
+downstream storage layer should order after (`After=` / `Wants=`) — it means "the
+NBDE unlock step has run". The role's own ZFS import chain orders on it today; a
+storage-pool role split out of this role will use the same seam, so consumers never
+depend on the internal `clevis-unlock-data.service` name. For "storage is actually
+assembled and healthy" (a stronger property) gate on the consumer's own barrier
+(e.g. `encrypted-storage-ready.target`), not this one.
 
 The unlock is **fail-degraded**: a disk that is missing, or whose Tang is
 unreachable after `clevis_unlock_retries` attempts, is logged and skipped rather

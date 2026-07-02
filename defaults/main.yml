@@ -61,6 +61,17 @@ clevis_install_zfs_packages: true
 # kernel module).
 clevis_ensure_pool: true
 
+# ── Boot-ordering unit ownership ──────────────────────────────────────────────
+# Whether this role deploys the ZFS import-chain units (encrypted-storage-import
+# / -pool-check / -ready.target, via tasks/storage-boot-ordering.yml).  Default
+# true (self-contained).  Set FALSE when a separate storage-pool role owns those
+# units — e.g. proxmox-install's proxmox_encrypted_storage.  clevis then deploys
+# only the UNLOCK half + the public clevis-luks-unlocked.target seam that the
+# storage role consumes, so the two roles don't both write the same unit files.
+# Transitional during the ZFS-consumer split; the storage half is removed from
+# this role entirely once ZFS no longer lives here.
+clevis_deploy_storage_units: true
+
 # ── Boot-time unlock (fail-degraded) ──────────────────────────────────────────
 # clevis-unlock-data.service retries Clevis/Tang decryption per disk at boot,
 # distinguishing a missing block device from a decrypt failure, and always

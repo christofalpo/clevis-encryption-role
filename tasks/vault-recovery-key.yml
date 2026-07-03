@@ -40,10 +40,18 @@
   no_log: true
 
 - name: "Vault-encrypt recovery key on controller"
+  # Use a LABELLED vault-id (not a bare --vault-password-file): on ansible-core
+  # 2.20, if the environment also has a global vault password (ansible.cfg
+  # vault_password_file or ANSIBLE_VAULT_PASSWORD_FILE) there are then two
+  # "default" vault-ids and `ansible-vault encrypt` refuses with "Specify the
+  # vault-id to encrypt with --encrypt-vault-id". Giving our secret an explicit
+  # label + --encrypt-vault-id makes the choice unambiguous regardless of any
+  # global default. Decrypt (load-recovery-key.yml) uses the same label.
   ansible.builtin.command: >
     ansible-vault encrypt
     {{ clevis_recovery_key_dest | default(clevis_recovery_key_path) }}
-    --vault-password-file {{ clevis_vault_password_file }}
+    --vault-id {{ clevis_vault_id | default('clevis') }}@{{ clevis_vault_password_file }}
+    --encrypt-vault-id {{ clevis_vault_id | default('clevis') }}
   changed_when: true
   delegate_to: localhost
   become: false

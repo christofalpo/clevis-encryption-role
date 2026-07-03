@@ -14,10 +14,11 @@
 #
 # Idempotency:
 #   - apt: state=present, no-op when packages are already installed
-#   - sysctl: writes /etc/sysctl.d/99-ipv6_disable.conf, reload-on-change only
 #   - blockinfile: managed nameservers live between markers, replaced (not
 #     appended) on changes — fixes the CRLF-in-resolv.conf accumulation bug
-#   - network-prereq.yml: blockinfile and copy modules, both idempotent
+#   - network-prereq.yml: probe + copy/file modules, all idempotent
+#   (Removal of stale artifacts from older versions lives in
+#    tasks/cleanup-legacy.yml, included first from main.yml.)
 
 - name: "Install required encryption packages"
   ansible.builtin.apt:
@@ -29,28 +30,20 @@
       - systemd-cryptsetup
       - util-linux
       - clevis-initramfs
-      - zfsutils-linux
-      - zfs-initramfs
+      # curl is what clevis-{encrypt,decrypt}-tang shell out to for Tang; the
+      # auto IP-family probe in network-prereq.yml uses the same binary.
+      - curl
     state: present
     update_cache: true
 
-- name: "Disable IPv6 for Tang reachability (clevis_ipv4_only=true)"
-  # Only applied when Tang servers are IPv4-only (e.g. Hetzner dual-stack
-  # hosts where the Tang whitelist only accepts IPv4 connections).
-  # When clevis_ipv4_only is false, IPv6 is left untouched — Tang may be
-  # reachable over IPv6 or the host may be a single-stack IPv4 environment
-  # that needs no explicit sysctl gate.
-  ansible.posix.sysctl:
-    name: "{{ item }}"
-    value: '1'
-    sysctl_set: true
-    sysctl_file: /etc/sysctl.d/99-ipv6_disable.conf
-    state: present
-    reload: true
-  loop:
-    - "net.ipv6.conf.default.disable_ipv6"
-    - "net.ipv6.conf.all.disable_ipv6"
-  when: clevis_ipv4_only | default(false) | bool
+# NOTE: this role is NBDE-only — it installs no storage/filesystem packages. The
+# ZFS/btrfs/LVM userland belongs to the downstream storage consumer role
+# (e.g. proxmox_encrypted_storage / encrypted_storage_pool).
+
+# NOTE: the old host-global IPv6 disable (/etc/sysctl.d/99-ipv6_disable.conf) and
+# the gai.conf IPv4-only gate are now removed by tasks/cleanup-legacy.yml, which
+# runs first (see main.yml) — so by this point IPv6 is back up on the live kernel
+# and the network-prereq probe below can use it.
 
 - name: "Detect managed-nameserver block markers in /etc/resolv.conf"
   # Used by the cleanup step below to decide whether this host still carries
@@ -110,8 +103,8 @@
     insertbefore: BOF
   when: clevis_dns_servers | length > 0
 
-- name: "Deploy or remove IPv4-only network gate (gai.conf + systemd unit)"
-  # network-prereq.yml writes the gai.conf precedence fix that makes
-  # getaddrinfo() prefer IPv4 over IPv6, plus the clevis-network-ready.service
-  # gate.  Idempotent — deploys when clevis_ipv4_only=true, removes otherwise.
+- name: "Pin clevis Tang IP family via curlrc (and retire the legacy gai.conf gate)"
+  # network-prereq.yml selects the IP family (auto-probe or explicit) and writes
+  # the clevis-scoped curlrc under clevis_curl_home, then removes the old
+  # gai.conf precedence block and clevis-network-ready.service.  Idempotent.
   ansible.builtin.include_tasks: network-prereq.yml

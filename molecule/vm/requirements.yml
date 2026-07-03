@@ -1,0 +1,10 @@
+---
+# Test-only dependency for the Tier-2 (vm) scenario: it composes
+# encrypted_storage_pool (btrfs) as the downstream consumer to validate clevis's
+# bring-up without ZFS. Installed into molecule/vm/roles/ by vm-tests.yml; source
+# of truth is its own repo. NOT a runtime dependency of the clevis role.
+roles:
+  - src: https://github.com/KvalitetsIT/encrypted-storage-pool.git
+    name: encrypted_storage_pool
+    scm: git
+    version: main

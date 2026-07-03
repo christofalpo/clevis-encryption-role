@@ -1,0 +1,16 @@
+---
+# Provision the encrypted host with the SPLIT stack: clevis_encryption unlocks
+# (NBDE-only, per host_vars) and encrypted_storage_pool assembles a btrfs pool
+# across the clevis-luks-unlocked.target seam. The provisioning block runs because
+# prepare.yml removed the controller-side recovery-key file (the gate).
+#
+# This validates clevis's OWN bring-up against a real downstream consumer without
+# any ZFS/DKMS in clevis. Only the target is converged; the Tang VM is infra.
+- name: "Converge — clevis NBDE unlock + encrypted_storage_pool (btrfs)"
+  hosts: clevis-target
+  become: true
+  gather_facts: true
+
+  roles:
+    - clevis_encryption
+    - encrypted_storage_pool

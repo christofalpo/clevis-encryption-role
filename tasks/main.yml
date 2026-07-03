@@ -5,15 +5,14 @@
 #
 #   PRESTAGE  (tag: prestage; idempotent and safe on un-encrypted nodes)
 #     Installs encryption packages, applies Tang network preconditions
-#     (DNS, IPv6 sysctl when clevis_ipv4_only=true, gai.conf gate).
+#     (DNS, plus the clevis curl IP-family pin written to a curlrc).
 #     Run on its own with --tags prestage to do this work ahead of the
 #     actual encryption window.
 #
 #   BLOCK: provisioning  (when: recovery key does not yet exist on controller)
-#     Generates a DR passphrase, fetches Tang advertisements, formats and
-#     binds all data disks with LUKS2/Clevis, then creates the ZFS pool and
-#     registers it with Proxmox.  The temporary key is always removed from
-#     the remote host via the block's always: handler, even on failure.
+#     Generates a DR passphrase, fetches Tang advertisements, and formats +
+#     binds all data disks with LUKS2/Clevis.  The temporary key is always
+#     removed from the remote host via the block's always: handler, even on failure.
 #
 #   BLOCK: boot ordering  (tag: systemd; always runs, idempotent)
 #     Writes /etc/crypttab entries and systemd drop-ins that ensure the
@@ -22,11 +21,9 @@
 #
 # Key variables (all have defaults in defaults/main.yml except tang_servers):
 #   clevis_encryption_enabled  — set false to skip the entire role
-#   clevis_pool_name           — ZFS pool name
 #   tang_servers               — must be set in group_vars / host_vars
 #   clevis_vault_password_file — vault password file on the controller
 #   clevis_keep_temp_key       — retain /tmp/ansible_luks_key (debug only)
-#   clevis_destroy_existing    — destroy existing pool before provisioning
 
 - name: "Skip: clevis_encryption_enabled is false"
   ansible.builtin.debug:
@@ -36,6 +33,16 @@
 - name: "Run clevis-encryption role"
   when: clevis_encryption_enabled | default(true) | bool
   block:
+
+    # ── LEGACY CLEANUP ──────────────────────────────────────────────────────
+    # Remove artifacts that previous versions of this role deployed and the
+    # current design no longer uses.  tags: always so it runs under any tag
+    # filter (full run, --tags prestage|provision|systemd) and on hosts last
+    # touched by any old version.  Ordered FIRST so the IPv6 live-reset happens
+    # before the network-prereq IP-family probe (which may need IPv6 up).
+    - name: "Clean up artifacts from previous role versions"
+      ansible.builtin.include_tasks: cleanup-legacy.yml
+      tags: always
 
     # ── PRESTAGE ────────────────────────────────────────────────────────────
     # Pre-stageable tasks: package install + Tang network preconditions.
@@ -119,89 +126,19 @@
       block:
 
         # --- Recovery key -------------------------------------------------------
-        - name: "Ensure host secrets directory exists on controller"
-          ansible.builtin.file:
-            path: "{{ clevis_recovery_key_path | dirname }}"
-            state: directory
-            mode: '0700'
-          delegate_to: localhost
-          become: false
+        # Generates the DR passphrase (sets clevis_passphrase) and stores it as
+        # the vault-encrypted recovery key on the controller.
+        - name: "Generate and vault the DR recovery key"
+          ansible.builtin.include_tasks: generate-recovery-key.yml
 
-        - name: "Generate 8-word DR passphrase (TitleCase, 4-10 chars per word)"
-          ansible.builtin.shell:
-            cmd: |
-              set -o pipefail
-              grep -E '^[a-z]{4,10}$' /usr/share/dict/words | shuf -n 8 \
-                | awk '{print toupper(substr($0,1,1)) substr($0,2)}' | paste -sd '-'
-            executable: /bin/bash
-          register: clevis_passphrase_raw
-          changed_when: false   # generates the secret but writes nothing on its own
-          delegate_to: localhost
-          become: false
-          check_mode: false
-          no_log: true
-
-        - name: "Store passphrase as play-scoped fact"
-          ansible.builtin.set_fact:
-            clevis_passphrase: "{{ clevis_passphrase_raw.stdout }}"
-          no_log: true
-
-        - name: "Write clear-text recovery key to controller (pre-vault)"
-          ansible.builtin.copy:
-            content: "{{ clevis_passphrase }}"
-            dest: "{{ clevis_recovery_key_path }}"
-            mode: '0600'
-          delegate_to: localhost
-          become: false
-          no_log: true
-
-        - name: "Vault-encrypt recovery key on controller"
-          ansible.builtin.command: >
-            ansible-vault encrypt
-            {{ clevis_recovery_key_path }}
-            --vault-password-file {{ clevis_vault_password_file }}
-          changed_when: true   # always rewrites the file when invoked (gated by parent block)
-          delegate_to: localhost
-          become: false
-
-        # Network preconditions for Tang (DNS, IPv6 sysctl, gai.conf gate) are
-        # handled by tasks/prestage.yml above — runs unconditionally on every
+        # Network preconditions for Tang (DNS + the clevis curl IP-family pin)
+        # are handled by tasks/prestage.yml above — runs unconditionally on every
         # full-role invocation, so by the time we reach this point the host is
         # already configured to talk to the Tang servers correctly.
 
         # --- Tang advertisement fetch and SSS assembly ------------------------
-        - name: "Fetch advertisement keys from Tang servers"
-          ansible.builtin.uri:
-            url: "{{ item }}/adv"
-            return_content: true
-            status_code: 200
-            body_format: json
-          loop: "{{ tang_servers | map(attribute='url') }}"
-          register: clevis_tang_adv
-          until: clevis_tang_adv is not failed
-          retries: 3
-          delay: 5
-          check_mode: false
-
-        - name: "Assemble Clevis SSS configuration (t=1 of N)"
-          ansible.builtin.set_fact:
-            tang_sss_cfg: >-
-              {%- set tang_list = [] -%}
-              {%- for resp in clevis_tang_adv.results -%}
-                {%- set _ = tang_list.append({'url': resp.item, 'adv': (resp.content | from_json)}) -%}
-              {%- endfor -%}
-              {{ {'t': 1, 'pins': {'tang': tang_list}} | to_json }}
-
-        - name: "Show assembled SSS config"
-          ansible.builtin.debug:
-            var: tang_sss_cfg
-
-        # --- Optional pool destruction ----------------------------------------
-        - name: "Destroy existing pool (clevis_destroy_existing=true)"
-          ansible.builtin.include_tasks: destroy-pool.yml
-          when: clevis_destroy_existing | default(false) | bool
-          vars:
-            target_pool: "{{ clevis_pool_name }}"
+        - name: "Fetch Tang advertisements and assemble SSS config"
+          ansible.builtin.include_tasks: tang-adv.yml
 
         # --- Disk provisioning ------------------------------------------------
         - name: "Write temporary key file to remote host"
@@ -212,15 +149,16 @@
             group: root
             mode: '0600'
 
-        - name: "Provision encryption on {{ item }}"
+        - name: "Provision encryption on each data disk"
           ansible.builtin.include_tasks: provision-disk.yml
           loop: "{{ clevis_raw_disks }}"
           loop_control:
             loop_var: disk_device
+            label: "{{ disk_device }}"
 
-        # --- ZFS pool and Proxmox registration --------------------------------
-        - name: "Create ZFS pool and register with Proxmox"
-          ansible.builtin.include_tasks: setup-pool.yml
+        # NOTE: this role is NBDE-only. Storage pool creation/import lives in a
+        # separate consumer role (e.g. proxmox_encrypted_storage) that orders on
+        # the clevis-luks-unlocked.target this role publishes.
 
       always:
         - name: "Remove temporary key from remote host"
@@ -232,8 +170,9 @@
     # ── BLOCK: BOOT ORDERING ────────────────────────────────────────────────
     # Always runs — idempotent and safe on already-encrypted live systems.
     #
-    # Applies the crypttab entries and systemd drop-ins that ensure disks are
-    # unlocked before ZFS import on every boot.
+    # Applies the crypttab entries and systemd drop-ins that unlock the disks at
+    # boot and publish clevis-luks-unlocked.target for a downstream storage
+    # consumer to order after.
     #
     # Can be run in isolation against an already-encrypted node:
     #   ansible-playbook ... --tags systemd
@@ -242,114 +181,22 @@
       tags: [systemd]
       block:
 
-        # The IPv4-only network gate (gai.conf precedence + clevis-network-ready.service)
-        # is handled by tasks/prestage.yml.  It is NOT re-run from this block;
+        # The clevis curl IP-family pin (curlrc under clevis_curl_home) is
+        # handled by tasks/prestage.yml.  It is NOT re-run from this block;
         # operators using --tags systemd to re-apply boot ordering on an already-
         # provisioned node should combine with prestage if they also want the
-        # network gate re-validated:  --tags prestage,systemd
+        # IP-family pin re-evaluated:  --tags prestage,systemd
 
-        - name: "Configure crypttab and live discard for {{ item }}"
+        - name: "Configure crypttab and live discard for each data disk"
           ansible.builtin.include_tasks: configure-disk.yml
           loop: "{{ clevis_raw_disks }}"
           loop_control:
             loop_var: disk_device
+            label: "{{ disk_device }}"
 
-        # ── clevis-luks-askpass network gate ───────────────────────────────
-        # Disk-independent: written once here, not inside the per-disk loop.
-        # Belt-and-suspenders: the clevis service will not attempt tang until
-        # the network is fully online, regardless of crypttab ordering.
-
-        - name: "Create systemd drop-in directory for clevis-luks-askpass"
-          ansible.builtin.file:
-            path: /etc/systemd/system/clevis-luks-askpass.service.d
-            state: directory
-            mode: '0755'
-            owner: root
-            group: root
-
-        - name: "Wait for network-online before clevis-luks-askpass attempts Tang"
-          ansible.builtin.copy:
-            dest: /etc/systemd/system/clevis-luks-askpass.service.d/network-online.conf
-            owner: root
-            group: root
-            mode: '0644'
-            content: |
-              [Unit]
-              After=network-online.target
-              Wants=network-online.target
-          notify: "Reload systemd daemon"
-
-        # ── ZFS import ordering ────────────────────────────────────────────
-        # Problem: remote-cryptsetup.target with nofail is satisfied as soon
-        # as crypt units START, not when they COMPLETE.  Using it as an After=
-        # anchor lets ZFS import race ahead of still-unlocking disks.
-        #
-        # Fix: anchor each ZFS import unit on the individual per-disk
-        # systemd-cryptsetup@ service units.  Those units complete only when
-        # the device is either open or has timed out — the mapper device
-        # exists before the service transitions to 'active' or 'failed'.
-        #
-        # ConditionPathExists= guards: if any mapper is still absent after
-        # all crypt units have run (genuine hardware failure or Tang timeout
-        # with no persistent key), the ZFS import unit is SKIPPED rather than
-        # importing a degraded pool.  The node boots to multi-user.target
-        # without ZFS, keeping it accessible for operator intervention.
-        #
-        # Three units are covered:
-        #   zfs-import-cache   — when /etc/zfs/zpool.cache is populated
-        #   zfs-import-scan    — fallback full-device scan (cache absent/empty)
-        #   zfs-import@        — Proxmox per-pool template unit
-        #
-        # All three receive identical drop-ins so the correct unit runs
-        # regardless of which import path systemd picks.
-
-        - name: "Create systemd drop-in directories for ZFS import units"
-          ansible.builtin.file:
-            path: "/etc/systemd/system/{{ item }}.d"
-            state: directory
-            mode: '0755'
-            owner: root
-            group: root
-          loop:
-            - zfs-import-cache.service
-            - zfs-import-scan.service
-            - zfs-import@.service
-
-        - name: "ZFS import units: wait for individual LUKS mappers, skip if any absent"
-          ansible.builtin.copy:
-            dest: "/etc/systemd/system/{{ item }}.d/after-luks-unlock.conf"
-            owner: root
-            group: root
-            mode: '0644'
-            content: |
-              [Unit]
-              # Wait for every individual LUKS device service to complete (open or
-              # timed out) before attempting pool import.  remote-cryptsetup.target
-              # with nofail is satisfied when units START, not complete — it cannot
-              # reliably gate ZFS import.
-              #
-              # ConditionPathExists= lines: if any mapper device is absent after all
-              # crypt units have run, this unit is skipped rather than importing the
-              # pool with missing members.  The node remains accessible but ZFS is not
-              # mounted — no silent degraded imports.
-              {% for disk in clevis_raw_disks %}
-              After=systemd-cryptsetup@crypt-{{ disk }}.service
-              {% endfor %}
-              {% for disk in clevis_raw_disks %}
-              ConditionPathExists=/dev/mapper/crypt-{{ disk }}
-              {% endfor %}
-          loop:
-            - zfs-import-cache.service
-            - zfs-import-scan.service
-            - zfs-import@.service
-          notify: "Reload systemd daemon"
-
-        - name: "Enable clevis-luks-askpass.path for late-boot unlock"
-          ansible.builtin.systemd:
-            name: clevis-luks-askpass.path
-            enabled: true
-            state: started
-          ignore_errors: "{{ ansible_check_mode }}"
-
-        - name: "Flush handlers (daemon_reload) before continuing"
-          ansible.builtin.meta: flush_handlers
+        # Systemd drop-ins: the clevis-luks-askpass network gate, the
+        # clevis-unlock-data service, and the public clevis-luks-unlocked.target
+        # seam. Factored out so replace-disk.yml can refresh them after the disk
+        # set changes (the unlock service's timeout scales with the disk count).
+        - name: "Write disk-set systemd boot-ordering drop-ins"
+          ansible.builtin.include_tasks: boot-ordering-dropins.yml

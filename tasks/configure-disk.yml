@@ -6,9 +6,9 @@
 # Called from tasks/main.yml inside the boot-ordering block, once per disk via
 # include_tasks loop.  The loop variable is disk_device (bare name, e.g. nvme0n1).
 #
-# Disk-independent systemd drop-ins (clevis-luks-askpass network gate,
-# zfs-import-cache ordering) are written once in main.yml after this loop —
-# they must not live here as they would be applied redundantly for every disk.
+# Disk-independent systemd drop-ins (clevis-luks-askpass network gate, the
+# clevis-unlock-data service + clevis-luks-unlocked.target) are written once in
+# main.yml after this loop — not here, where they would be redundant per disk.
 #
 # Idempotent: lineinfile (with regexp) replaces any existing crypttab entry for
 # this device regardless of its current flags; cryptsetup refresh is only called
@@ -22,7 +22,10 @@
 #
 # Reboot note:
 #   Discard is applied to the running mapper immediately (cryptsetup refresh).
-#   New crypttab flags take effect at next boot.
+#   Across reboots, discard persists because clevis-unlock-data opens each
+#   mapper with {{ clevis_luks_open_options }} (--allow-discards) — NOT via the
+#   crypttab 'discard' option, which is inert for these noauto disks (systemd
+#   never opens them; clevis-unlock-data does).
 #   dm-crypt workqueue and CPU-pinning tuning belong in proxmox-storage-tuning
 #   and may require a scheduled maintenance reboot.
 
@@ -50,9 +53,11 @@
     #                   remote-cryptsetup.target entirely, stripping all network
     #                   ordering and causing 600+ failed tang attempts before the
     #                   link was up).
+    #   noauto        - don't decrypt in early boot; clevis-unlock-data opens
+    #                   these disks in the booted system, after network-online.
     #   nofail        — boot continues even if unlock times out (tang offline).
     #   discard       — passes TRIM/discard through to the NVMe for wear-levelling.
-    line: "crypt-{{ disk_device }} UUID={{ disk_uuid.stdout }} none luks,discard,nofail,_netdev,x-systemd.after=network-online.target"
+    line: "crypt-{{ disk_device }} UUID={{ disk_uuid.stdout }} none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target"
     create: true
     mode: '0600'
     owner: root
@@ -60,13 +65,15 @@
   notify: "Rebuild initramfs"
 
 # ── Live discard passthrough ──────────────────────────────────────────────────
-# The crypttab entry above ensures discard is enabled at next boot.
-# This block applies it immediately to the running mapper so the effect is
-# not deferred until the next maintenance reboot.
+# Persistence across reboots is handled by clevis-unlock-data opening the mapper
+# with --allow-discards (see clevis_luks_open_options); the crypttab 'discard'
+# option does NOT achieve it here because these disks are noauto.  This block
+# applies discard immediately to the already-open mapper so the effect is not
+# deferred until the next reboot.
 #
 # cryptsetup refresh re-applies flags to an open dm-crypt device without
 # interrupting I/O or closing the mapper.  It is safe to call on a live
-# production system with active ZFS workloads.
+# production system with active storage workloads.
 #
 # Note: ansible.builtin.stat misreports symlinks-to-block-devices in
 # /dev/mapper/ as absent, so we use 'cryptsetup status' (rc=0 if open,
@@ -84,31 +91,63 @@
   check_mode: false
 
 - name: "Apply discard passthrough to running mapper: {{ disk_device }}"
-  # Reloads the live dm-crypt device table to add allow_discards using dmsetup
-  # rather than 'cryptsetup refresh --token-only'.  The device is already open
-  # and the volume key is already in the kernel keyring; dmsetup reload reuses
-  # the existing keyring reference without any Tang/Clevis authentication round-
-  # trip.  This avoids the Tang dependency that causes 'cryptsetup refresh
-  # --token-only' to fail silently when Tang is temporarily unreachable.
+  # Enables allow_discards on the open mapper without a reboot via
+  # 'cryptsetup refresh', fed by the device's own Clevis binding.
   #
-  # Steps: read current table (key shown as ":N:logon:cryptsetup:UUID" keyring
-  # ref), increment the optional-param count, append allow_discards, then
-  # suspend → reload → resume (same sequence cryptsetup refresh uses internally;
-  # the suspend is sub-millisecond and safe on live ZFS workloads).
+  # NOT raw 'dmsetup reload' (the previous approach): a standalone dmsetup
+  # process cannot resolve the LUKS2 volume key — cryptsetup links it into the
+  # OPENING process's kernel keyring possessor-scoped, so dmsetup reload fails
+  # "device-mapper: reload ioctl failed: Required key not available" and silently
+  # leaves allow_discards unset (proven across 6 VM runs).  cryptsetup IS the
+  # possessor when it re-derives the key, so 'refresh' succeeds.  The passphrase
+  # is recovered from Clevis (purpose-built `clevis luks pass -s`, falling back
+  # to decrypting the LUKS2 Clevis token JWE) and piped DIRECTLY into
+  # --key-file - (no command substitution, to preserve the exact key bytes).
   #
-  # Persistence is handled by the crypttab 'discard' flag written above.
+  # Only discard is applied here; dm-crypt perf flags are proxmox_storage_tuning's
+  # concern.  Honest: verifies allow_discards landed in the live dm table and
+  # fails loudly if Clevis recovery did not work (it then activates on next boot
+  # via clevis-unlock-data).
   # Idempotent: skipped when 'discards' is already in the active mapper flags.
   ansible.builtin.shell:
     cmd: |
-      set -o pipefail
-      TABLE=$(dmsetup table --showkeys "crypt-{{ disk_device }}")
-      FIXED=$(echo "$TABLE" | awk '{print $1,$2,$3,$4,$5,$6,$7,$8}')
-      OPTCNT=$(echo "$TABLE" | awk '{print (NF>8) ? $9+1 : 1}')
-      OPTS=$(echo "$TABLE" | awk '{if(NF>9){for(i=10;i<=NF;i++) printf "%s ",$i}}')
-      dmsetup suspend "crypt-{{ disk_device }}"
-      dmsetup reload  "crypt-{{ disk_device }}" --table "$FIXED $OPTCNT ${OPTS}allow_discards"
-      dmsetup resume  "crypt-{{ disk_device }}"
+      set -uo pipefail
+      NAME="crypt-{{ disk_device }}"
+      DEV="/dev/{{ disk_device }}"
+      applied=""
+
+      slot=$(clevis luks list -d "$DEV" 2>/dev/null | head -1 | cut -d: -f1 | tr -d ' ')
+      if [ -n "$slot" ]; then
+        if clevis luks pass -d "$DEV" -s "$slot" 2>/dev/null \
+             | cryptsetup refresh --allow-discards --key-file - "$NAME" 2>/dev/null; then
+          applied="clevis-pass(slot $slot)"
+        fi
+      fi
+      if [ -z "$applied" ]; then
+        tid=$(cryptsetup luksDump "$DEV" 2>/dev/null \
+              | awk -F: '/^[[:space:]]+[0-9]+: clevis/{gsub(/[^0-9]/,"",$1); print $1; exit}')
+        if [ -n "$tid" ]; then
+          if cryptsetup token export --token-id "$tid" "$DEV" 2>/dev/null \
+               | jose fmt -j- -Og jwe -o- 2>/dev/null \
+               | jose jwe fmt -i- -c 2>/dev/null \
+               | clevis decrypt 2>/dev/null \
+               | cryptsetup refresh --allow-discards --key-file - "$NAME" 2>/dev/null; then
+            applied="clevis-token(id $tid)"
+          fi
+        fi
+      fi
+
+      if dmsetup table "$NAME" 2>/dev/null | grep -q allow_discards; then
+        echo "discard enabled on $NAME${applied:+ via $applied}"
+        exit 0
+      fi
+      echo "could not enable live discard on $NAME (Clevis recovery failed); it activates on next boot via clevis-unlock-data" >&2
+      exit 1
     executable: /bin/bash
+  environment:
+    PATH: "/usr/sbin:/usr/bin:/sbin:/bin"
+    # clevis-decrypt-tang curls the recovery endpoint; pin the IP family.
+    CURL_HOME: "{{ clevis_curl_home }}"
   when:
     - _mapper_status.rc == 0
     - "'discards' not in _mapper_status.stdout"

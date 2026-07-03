@@ -1,31 +1,53 @@
 ---
+# Tier-1 (VM) scenario: validate the LUKS KEYSLOT layer — `clevis luks bind` /
+# `unlock -o`, the /etc/crypttab entry, durable `allow_discards`, the
+# cleanup-legacy content guard, and the curlrc IP-family auto-probe — on a REAL
+# virtio block device.
+#
+# Substrate: a throwaway Debian 13 (Trixie) VM under Vagrant + libvirt/KVM with
+# one extra blank virtio disk (/dev/vdb).  This replaces the old privileged
+# Docker container: there is no mknod, no losetup, no loopback hack — the role's
+# configure-disk runs against an actual dm-crypt mapper on a real disk.
+#
+# Scope stays lean and reboot-free: boot ordering, storage assembly and the reboot are
+# out of scope here — that is the Tier-2 VM test (molecule/vm).  This tier proves
+# only the keyslot/crypttab/cleanup layer, fast, without a reboot.
 dependency:
   name: galaxy
 
 driver:
-  name: docker
+  name: vagrant
+  provider:
+    name: libvirt
+  # Disable vagrant-cachier.  The debian/trixie64 box's own Vagrantfile forces an
+  # NFS /vagrant mount, and the driver auto-enables vagrant-cachier (also NFS)
+  # when the plugin is installed; NFS exports need root (sudo on /etc/exports),
+  # which breaks the rootless model.  Any value other than machine/box makes the
+  # driver emit `config.cache.disable!`.  The /vagrant folder is already disabled
+  # by the driver default (synced_folder: false), so no NFS export is attempted.
+  cachier: disabled
 
 platforms:
   - name: clevis-encryption-debian13
-    image: geerlingguy/docker-debian13-ansible:latest
-    pre_build_image: true
-    privileged: true
-    cgroupns_mode: host
-    volumes:
-      - /sys/fs/cgroup:/sys/fs/cgroup:rw
-    command: /lib/systemd/systemd
-    # The container needs /dev/loop* and /dev/mapper/* for LUKS/dm-crypt.
-    # These are created by the prepare playbook using losetup + cryptsetup.
-    devices:
-      - /dev/loop-control:/dev/loop-control
-    capabilities:
-      - SYS_ADMIN
-      - NET_ADMIN
-      - MKNOD
-    tmpfs:
-      - /run
-      - /run/lock
-      - /tmp
+    box: debian/trixie64
+    memory: 2048
+    cpus: 2
+    provider_options:
+      # Use SYSTEM libvirt (qemu:///system), NOT the plugin's default session
+      # mode.  vagrant-libvirt has no usermode/slirp support: it discovers the
+      # guest IP from libvirt's DHCP lease table, which session mode cannot
+      # provide.  System mode lets vagrant auto-create (and auto-destroy) its own
+      # `vagrant-libvirt` NAT+DHCP network per run.  This host grants the invoking
+      # user system-libvirt access via the `libvirt` group + polkit, so it stays
+      # ROOTLESS (no sudo) and leaves no persistent host network behind.
+      qemu_use_session: false
+    # One extra blank 2 GB virtio disk -> /dev/vdb (vda is the box root).  This
+    # is the real LUKS/clevis data disk that prepare.yml formats, binds and
+    # opens; the role's configure-disk then live-applies discard and writes the
+    # crypttab entry for it.  Rendered by the molecule vagrant driver as
+    # `libvirt.storage :file, ...` inside the provider block.
+    provider_raw_config_args:
+      - "storage :file, :size => '2G', :type => 'qcow2', :bus => 'virtio', :device => 'vdb'"
 
 provisioner:
   name: ansible
@@ -35,20 +57,37 @@ provisioner:
   inventory:
     host_vars:
       clevis-encryption-debian13:
-        # Pre-set the disk list so the discovery task is skipped.
-        # The prepare playbook creates /dev/loop0 as a LUKS2 device.
+        # Real virtio data disk created by the libvirt provider above — the
+        # discovery task is skipped because the list is pre-set.
         clevis_raw_disks:
-          - loop0
-        # Use a path inside the container so the delegate_to: localhost tasks
-        # write to the Molecule temp directory rather than a real inventory.
+          - vdb
+        # delegate_to: localhost tasks (and the role's recovery-key gate) read
+        # this on the CONTROLLER, so a controller-side path keeps provisioning
+        # skipped (prepare.yml pre-creates the file there).
         clevis_recovery_key_path: "/tmp/molecule_recovery_key.txt"
         # Tang server is mocked — provisioning block is skipped because the
         # recovery key file is pre-created by the prepare playbook.
         tang_servers:
           - url: "http://127.0.0.1:7500"
-        clevis_ipv4_only: true
-        clevis_register_proxmox_storage: false
+        # auto-probe: prepare.yml runs a real Tang on 127.0.0.1:7500 bound to IPv4
+        # only, so the probe sees v4 OK / v6 FAIL and deterministically pins ipv4
+        # — exercising the real detection path, not just the curlrc write.
+        clevis_curl_ip_version: auto
         clevis_vault_password_file: "/dev/null"
+
+scenario:
+  # Explicit sequence: omit dependency (collections are installed outside
+  # molecule), and cleanup / side_effect (no such playbooks in this scenario),
+  # so `molecule test` emits no "Missing playbook/requirements" warnings.
+  test_sequence:
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - idempotence
+    - verify
+    - destroy
 
 verifier:
   name: ansible

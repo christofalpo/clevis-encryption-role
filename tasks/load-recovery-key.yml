@@ -1,0 +1,36 @@
+---
+# Decrypts the vaulted recovery key on the controller and writes it to a key
+# file on the remote host so cryptsetup/clevis can use it.  Reused by
+# replace-disk.yml and rotate-passphrase.yml.
+#
+# The CALLER is responsible for removing the remote key file afterwards
+# (wrap the include in a block with an always: that deletes it).
+#
+# Inputs:
+#   clevis_recovery_key_src     vaulted key path on controller (default: clevis_recovery_key_path)
+#   clevis_recovery_key_remote  remote temp key path (default: /tmp/ansible_luks_key)
+
+- name: "Decrypt vaulted recovery key on the controller"
+  # Same labelled vault-id the encrypt side uses (see vault-recovery-key.yml) so
+  # the pair is symmetric and works even under vault_id_match=True. Decrypt itself
+  # is not subject to the 2.20 "two default vault-ids" encrypt error.
+  ansible.builtin.command: >
+    ansible-vault decrypt
+    {{ clevis_recovery_key_src | default(clevis_recovery_key_path) }}
+    --vault-id {{ clevis_vault_id | default('clevis') }}@{{ clevis_vault_password_file }}
+    --output -
+  register: _clevis_recovery_plain
+  changed_when: false
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  no_log: true
+
+- name: "Write recovery key to remote host"
+  ansible.builtin.copy:
+    dest: "{{ clevis_recovery_key_remote | default('/tmp/ansible_luks_key') }}"
+    content: "{{ _clevis_recovery_plain.stdout }}"
+    owner: root
+    group: root
+    mode: '0600'
+  no_log: true

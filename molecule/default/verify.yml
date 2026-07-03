@@ -1,13 +1,15 @@
 ---
-# Verifies the expected post-convergence state.
+# Verifies the post-convergence state of the Tier-1 (VM) scenario.
 #
 # Checks:
-#   1. /etc/crypttab contains the correct entry for loop0
-#   2. /dev/mapper/crypt-loop0 is present (mapper is open and discards active)
-#   3. gai.conf contains both IPv4 precedence lines (clevis_ipv4_only=true)
-#   4. clevis-network-ready.service unit file is deployed
-#   5. clevis-luks-askpass.service.d/ipv4-only.conf is deployed
-#   6. clevis-luks-askpass.service.d/network-online.conf is deployed
+#   1. /etc/crypttab has the correct crypt-vdb entry (flags).
+#   2. crypt-vdb mapper is open and the role's live-apply enabled discards.
+#   3. curlrc auto-probe pinned --ipv4 (Tang is IPv4-only) and not --ipv6.
+#   4. cleanup-legacy removed OWNED artifacts and PRESERVED foreign look-alikes;
+#      the gai.conf operator line survives, the marked block is gone.
+#   5. clevis-luks-askpass network-online drop-in is present.
+#   6. The vendored harness proves `clevis luks unlock -o "--allow-discards"`
+#      (and the live-refresh path) land allow_discards.
 
 - name: "Verify"
   hosts: all
@@ -16,73 +18,99 @@
 
   tasks:
 
+    # ── 1. crypttab ──────────────────────────────────────────────────────────
     - name: "Read /etc/crypttab"
       ansible.builtin.slurp:
         src: /etc/crypttab
       register: _crypttab
 
-    - name: "Assert crypttab contains crypt-loop0 with correct flags"
+    - name: "Assert crypttab contains crypt-vdb with correct flags"
       ansible.builtin.assert:
         that:
-          - "'crypt-loop0' in (_crypttab.content | b64decode)"
+          - "'crypt-vdb' in (_crypttab.content | b64decode)"
           - "'_netdev' in (_crypttab.content | b64decode)"
           - "'x-systemd.after=network-online.target' in (_crypttab.content | b64decode)"
           - "'discard' in (_crypttab.content | b64decode)"
           - "'nofail' in (_crypttab.content | b64decode)"
-        fail_msg: "/etc/crypttab does not have the expected crypt-loop0 entry"
+        fail_msg: "/etc/crypttab does not have the expected crypt-vdb entry"
 
-    - name: "Assert /dev/mapper/crypt-loop0 exists"
+    # ── 2. mapper open + live discard applied by configure-disk ──────────────
+    - name: "Assert /dev/mapper/crypt-vdb exists"
       ansible.builtin.stat:
-        path: /dev/mapper/crypt-loop0
+        path: /dev/mapper/crypt-vdb
       register: _mapper
 
     - name: "Fail if mapper device is absent"
       ansible.builtin.assert:
         that: _mapper.stat.exists
-        fail_msg: "/dev/mapper/crypt-loop0 is not present — LUKS device was not opened"
+        fail_msg: "/dev/mapper/crypt-vdb is not present — LUKS device was not opened"
 
-    - name: "Assert cryptsetup status shows discards enabled"
-      ansible.builtin.command: cryptsetup status crypt-loop0
+    - name: "Read cryptsetup status for crypt-vdb"
+      ansible.builtin.command: cryptsetup status crypt-vdb
       register: _cs_status
       changed_when: false
 
-    - name: "Fail if discards not active on mapper"
+    - name: "Fail if discards not active on mapper (configure-disk live-apply)"
       ansible.builtin.assert:
         that: "'discards' in _cs_status.stdout"
-        fail_msg: "discards flag is not active on crypt-loop0"
+        fail_msg: "discards flag is not active on crypt-vdb — clevis live-refresh did not apply"
+
+    # ── 3. curlrc IP-family auto-probe ───────────────────────────────────────
+    - name: "Read the clevis curlrc"
+      ansible.builtin.slurp:
+        src: /etc/clevis/curl/.curlrc
+      register: _curlrc
+
+    - name: "Assert auto-probe pinned --ipv4 (Tang is IPv4-only)"
+      ansible.builtin.assert:
+        that:
+          - "'--ipv4' in (_curlrc.content | b64decode)"
+          - "'--ipv6' not in (_curlrc.content | b64decode)"
+        fail_msg: "/etc/clevis/curl/.curlrc did not auto-pin --ipv4"
+
+    # ── 4. cleanup-legacy: owned removed, foreign preserved ──────────────────
+    - name: "Stat artifacts that cleanup-legacy must REMOVE (owned)"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /etc/systemd/system/clevis-network-ready.service
+        - /etc/systemd/system/clevis-luks-askpass.service.wants/clevis-network-ready.service
+        - /etc/systemd/system/networking.service.d/10-override.conf
+        - /etc/sysctl.d/99-ipv6_disable.conf
+      register: _owned
+
+    - name: "Assert owned legacy artifacts were removed"
+      ansible.builtin.assert:
+        that: not item.stat.exists
+        fail_msg: "{{ item.item }} should have been removed by cleanup-legacy"
+      loop: "{{ _owned.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: "Stat the FOREIGN look-alike that must be PRESERVED"
+      ansible.builtin.stat:
+        path: /etc/systemd/system/clevis-luks-askpass.service.d/ipv4-only.conf
+      register: _foreign
+
+    - name: "Assert foreign look-alike was preserved (no role signature)"
+      ansible.builtin.assert:
+        that: _foreign.stat.exists
+        fail_msg: "foreign clevis-luks-askpass ipv4-only.conf was wrongly removed — content guard failed"
 
     - name: "Read /etc/gai.conf"
       ansible.builtin.slurp:
         src: /etc/gai.conf
       register: _gai
 
-    - name: "Assert gai.conf contains both IPv4 precedence lines"
+    - name: "Assert gai.conf: marked block gone, operator line preserved"
       ansible.builtin.assert:
         that:
-          - "'precedence ::ffff:0:0/96' in (_gai.content | b64decode)"
-          - "'precedence ::/0' in (_gai.content | b64decode)"
-        fail_msg: "/etc/gai.conf is missing the IPv4 precedence block"
+          - "'ANSIBLE MANAGED clevis-encryption ipv4-only' not in (_gai.content | b64decode)"
+          - "'precedence ::ffff:0:0/96' not in (_gai.content | b64decode)"
+          - "'label ::1/128 0' in (_gai.content | b64decode)"
+        fail_msg: "gai.conf cleanup wrong — block must be removed but operator content kept"
 
-    - name: "Assert clevis-network-ready.service is deployed"
-      ansible.builtin.stat:
-        path: /etc/systemd/system/clevis-network-ready.service
-      register: _cnr
-
-    - name: "Fail if clevis-network-ready.service is absent"
-      ansible.builtin.assert:
-        that: _cnr.stat.exists
-        fail_msg: "clevis-network-ready.service was not deployed"
-
-    - name: "Assert ipv4-only drop-in is deployed"
-      ansible.builtin.stat:
-        path: /etc/systemd/system/clevis-luks-askpass.service.d/ipv4-only.conf
-      register: _ipv4dropin
-
-    - name: "Fail if ipv4-only.conf drop-in is absent"
-      ansible.builtin.assert:
-        that: _ipv4dropin.stat.exists
-        fail_msg: "ipv4-only.conf drop-in was not deployed"
-
+    # ── 5. live-unlock network-online drop-in ────────────────────────────────
     - name: "Assert network-online drop-in is deployed"
       ansible.builtin.stat:
         path: /etc/systemd/system/clevis-luks-askpass.service.d/network-online.conf
@@ -92,3 +120,26 @@
       ansible.builtin.assert:
         that: _netdropin.stat.exists
         fail_msg: "network-online.conf drop-in was not deployed"
+
+    # ── 6. clevis unlock -o "--allow-discards" (vendored harness) ────────────
+    - name: "Copy the durable-open discard harness"
+      ansible.builtin.copy:
+        src: files/harness-unlock-o.sh
+        dest: /root/harness-unlock-o.sh
+        mode: '0755'
+
+    - name: "Run the durable-open discard harness"
+      ansible.builtin.command: /root/harness-unlock-o.sh
+      register: _harness
+      changed_when: false
+
+    - name: "Show harness output"
+      ansible.builtin.debug:
+        var: _harness.stdout_lines
+
+    - name: "Assert harness passed (clevis unlock -o landed allow_discards, FAIL=0)"
+      ansible.builtin.assert:
+        that:
+          - _harness.rc == 0
+          - "'FAIL=0' in _harness.stdout"
+        fail_msg: "harness-unlock-o.sh reported failures — see output above"

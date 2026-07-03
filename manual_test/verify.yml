@@ -1,0 +1,61 @@
+---
+# Post-REBOOT assertions for the NBDE VM smoke test. Run by manual_test/run.sh
+# after the role has provisioned the disks and the VM has been rebooted, so these
+# checks observe the REAL systemd boot chain — not the provisioning run.
+#
+# This role is NBDE-only, so this test proves the UNLOCK half end to end:
+#   - the data disks were unlocked at boot by clevis-unlock-data via the EXTERNAL
+#     Tang over the network (only possible after network-online.target);
+#   - clevis-luks-unlocked.target (the public seam a storage consumer orders after)
+#     was reached;
+#   - allow_discards survived the reboot (durable open, not just the live-apply).
+# Assembling + mounting a pool is a downstream consumer's concern and is NOT
+# asserted here.
+- name: "Verify boot-time clevis/Tang unlock (post-reboot, NBDE)"
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: "Assert clevis-luks-unlocked.target reached (the public seam)"  # noqa: command-instead-of-module
+      # is-active is a read-only query; the systemd module cannot assert it, and
+      # for oneshot RemainAfterExit units service_facts misreports "stopped".
+      ansible.builtin.command: systemctl is-active clevis-luks-unlocked.target
+      register: _unlocked
+      changed_when: false
+      failed_when: _unlocked.stdout != "active"
+
+    - name: "Assert the clevis-unlock-data service succeeded"  # noqa: command-instead-of-module
+      ansible.builtin.command: systemctl is-active clevis-unlock-data.service
+      register: _svc
+      changed_when: false
+      failed_when: _svc.stdout != "active"
+
+    - name: "Assert both data mappers are open after boot"
+      ansible.builtin.command: "cryptsetup status crypt-{{ item }}"
+      loop: [vdb, vdc]
+      changed_when: false
+      loop_control:
+        label: "crypt-{{ item }}"
+
+    - name: "Assert allow_discards is durable across the reboot on each mapper"
+      ansible.builtin.command: "dmsetup table crypt-{{ item }}"
+      loop: [vdb, vdc]
+      register: _dm
+      changed_when: false
+      failed_when: "'allow_discards' not in _dm.stdout"
+      loop_control:
+        label: "crypt-{{ item }}"
+
+    - name: "Assert the boot unlock happened (clevis-unlock-data unlocked the disks)"
+      ansible.builtin.command: journalctl -b -u clevis-unlock-data.service --no-pager
+      register: _journal
+      changed_when: false
+      failed_when: "'unlocked' not in _journal.stdout"
+
+    - name: "PASS"
+      ansible.builtin.debug:
+        msg: >-
+          NBDE smoke test PASSED — both data disks unlocked at boot from the
+          external Tang, clevis-luks-unlocked.target reached, allow_discards
+          durable across the reboot.

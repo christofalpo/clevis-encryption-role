@@ -1,0 +1,3 @@
+.ansible/
+test-logs/
+molecule/*/roles/encrypted_storage_pool/

@@ -1,0 +1,33 @@
+---
+# yamllint config for the clevis-encryption role (Tier-0 CI validation).
+# Aligned with how the repo is written and with ansible-lint's own YAML checks:
+# long explanatory comment lines are allowed up to 160 cols, and a few noisy
+# rules are relaxed. Structural rules (indentation, keys, brackets) stay strict.
+extends: default
+
+rules:
+  line-length:
+    max: 160
+    level: error
+  comments:
+    # Molecule/driver-generated and hand-written comments use a single space.
+    min-spaces-from-content: 1
+  comments-indentation: disable
+  truthy:
+    allowed-values: ['true', 'false']
+    check-keys: false
+  # Forbid ambiguous octal literals (e.g. an unquoted mode 0644) — the repo
+  # quotes all modes, and this matches what ansible-lint expects of the config.
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true
+  # Allow one space inside flow collections, e.g. `{ unit: x, enabled: true }`
+  # (matches ansible-lint's bundled yamllint config).
+  braces:
+    max-spaces-inside: 1
+  brackets:
+    max-spaces-inside: 1
+
+ignore: |
+  .run/
+  test-logs/

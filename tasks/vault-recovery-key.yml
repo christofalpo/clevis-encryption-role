@@ -1,0 +1,57 @@
+---
+# Persists the clevis_passphrase fact to the controller as a vault-encrypted
+# recovery key file.  Reused by generate-recovery-key.yml (first run) and
+# rotate-passphrase.yml (re-vault after a successful rotation).
+#
+# Inputs:
+#   clevis_passphrase            the secret to store (fact; set by generate-passphrase.yml)
+#   clevis_recovery_key_dest     destination path (default: clevis_recovery_key_path)
+#   clevis_recovery_key_backup   copy an existing dest to <dest>.bak first (default: false)
+#
+# ansible-vault encrypt requires plaintext input, so we always (over)write the
+# clear-text first, then encrypt in place — this is correct for both first-run
+# (fresh file) and rotation (dest was previously vaulted, now overwritten).
+
+- name: "Ensure host secrets directory exists on controller"
+  ansible.builtin.file:
+    path: "{{ (clevis_recovery_key_dest | default(clevis_recovery_key_path)) | dirname }}"
+    state: directory
+    mode: '0700'
+  delegate_to: localhost
+  become: false
+
+- name: "Back up existing vaulted recovery key (pre-rotation safety)"
+  ansible.builtin.copy:
+    src: "{{ clevis_recovery_key_dest | default(clevis_recovery_key_path) }}"
+    dest: "{{ clevis_recovery_key_dest | default(clevis_recovery_key_path) }}.bak"
+    remote_src: false
+    mode: '0600'
+  delegate_to: localhost
+  become: false
+  when: clevis_recovery_key_backup | default(false) | bool
+
+- name: "Write clear-text recovery key to controller (pre-vault)"
+  ansible.builtin.copy:
+    content: "{{ clevis_passphrase }}"
+    dest: "{{ clevis_recovery_key_dest | default(clevis_recovery_key_path) }}"
+    mode: '0600'
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: "Vault-encrypt recovery key on controller"
+  # Use a LABELLED vault-id (not a bare --vault-password-file): on ansible-core
+  # 2.20, if the environment also has a global vault password (ansible.cfg
+  # vault_password_file or ANSIBLE_VAULT_PASSWORD_FILE) there are then two
+  # "default" vault-ids and `ansible-vault encrypt` refuses with "Specify the
+  # vault-id to encrypt with --encrypt-vault-id". Giving our secret an explicit
+  # label + --encrypt-vault-id makes the choice unambiguous regardless of any
+  # global default. Decrypt (load-recovery-key.yml) uses the same label.
+  ansible.builtin.command: >
+    ansible-vault encrypt
+    {{ clevis_recovery_key_dest | default(clevis_recovery_key_path) }}
+    --vault-id {{ clevis_vault_id | default('clevis') }}@{{ clevis_vault_password_file }}
+    --encrypt-vault-id {{ clevis_vault_id | default('clevis') }}
+  changed_when: true
+  delegate_to: localhost
+  become: false

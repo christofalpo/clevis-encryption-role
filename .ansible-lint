@@ -1,0 +1,14 @@
+---
+# Each molecule scenario resolves the role-under-test through a self-referential
+# symlink (molecule/<scenario>/roles/clevis_encryption -> the repo root) — the
+# standard molecule layout.  With more than one scenario, ansible-lint's file
+# walk follows both symlinks and recurses without end (OSError: too many levels
+# of symbolic links).  Exclude the symlinked role copies from traversal; role
+# RESOLUTION is unaffected (it uses the playbook's roles/ search path), so the
+# scenarios' `roles: [clevis_encryption]` still resolves under both lint and
+# molecule.
+exclude_paths:
+  - molecule/default/roles/
+  - molecule/network/roles/
+  - molecule/vm/roles/
+  - manual_test/roles/

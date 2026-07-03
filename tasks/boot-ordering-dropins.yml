@@ -1,0 +1,118 @@
+---
+# Disk-SET systemd boot ordering for the NBDE unlock. Factored out of main.yml so
+# replace-disk.yml can refresh it after the disk set changes (the unlock service's
+# TimeoutStartSec scales with the disk count).
+#
+# This role is NBDE-only. It deploys:
+#   - the clevis-luks-askpass network-online gate,
+#   - the fail-degraded clevis-unlock-data.service (retries Tang per disk; always
+#     exits 0), which opens the crypt-* mappers in the booted system, and
+#   - the PUBLIC clevis-luks-unlocked.target seam a downstream storage consumer
+#     (e.g. proxmox_encrypted_storage / encrypted_storage_pool) orders after.
+#
+# The data disks carry `noauto` in crypttab, so systemd-cryptsetup does not open
+# them in early boot; clevis-unlock-data does, after network-online.target. That
+# late, network-ordered unlock is what a consumer's import chain gates on — kept
+# OUT of the early local-fs / zfs-import graph to avoid a systemd ordering cycle.
+# Idempotent and safe on already-encrypted nodes.
+
+# NOTE: an EARLIER version of this role wrote a networking.service early bring-up
+# drop-in (networking.service.d/10-override.conf) that was validated to BREAK boot.
+# This role no longer writes it. It is removed by tasks/cleanup-legacy.yml —
+# CONTENT-GUARDED, so a same-named foreign file is never blindly deleted.
+
+# ── clevis-luks-askpass network gate (belt-and-suspenders) ──────────────────
+- name: "Create systemd drop-in directory for clevis-luks-askpass"
+  ansible.builtin.file:
+    path: /etc/systemd/system/clevis-luks-askpass.service.d
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: "Wait for network-online before clevis-luks-askpass attempts Tang"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/clevis-luks-askpass.service.d/network-online.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
+      [Unit]
+      After=network-online.target
+      Wants=network-online.target
+  notify: "Reload systemd daemon"
+
+# ── 1. Retry-driven, fail-degraded unlock ───────────────────────────────────
+- name: "Deploy fail-degraded Clevis unlock script"
+  ansible.builtin.template:
+    src: clevis-unlock-data.sh.j2
+    dest: /usr/local/sbin/clevis-unlock-data
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: "Deploy clevis-unlock-data.service"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/clevis-unlock-data.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
+      [Unit]
+      Description=Unlock Clevis/Tang LUKS data disks (fail-degraded, with retries)
+      Documentation=file:///usr/local/sbin/clevis-unlock-data
+      After=network-online.target
+      Wants=network-online.target
+      # NOTE: no [Install] and not ordered Before any early target — it is pulled
+      # in by clevis-luks-unlocked.target (Requires/After). Keeping it OUT of the
+      # early zfs-import/local-fs graph is what avoids the ordering cycle.
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/clevis-unlock-data
+      TimeoutStartSec={{ (clevis_unlock_retries | int)
+                         * (clevis_unlock_attempt_timeout | int + clevis_unlock_retry_delay | int)
+                         * (clevis_raw_disks | length | int) + 120 }}
+  notify: "Reload systemd daemon"
+
+# ── 1b. Public unlock sync point (the storage-consumer contract) ─────────────
+# The STABLE name a downstream storage consumer orders After=/Wants= to run after
+# NBDE unlock — so consumers never hard-code the internal clevis-unlock-data
+# .service name. Reached once the fail-degraded unlock step has RUN (a partial
+# unlock still reaches it). "Storage is actually assembled + healthy" is a
+# stronger property owned by the consumer's own barrier.
+- name: "Deploy clevis-luks-unlocked.target (public unlock sync point)"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/clevis-luks-unlocked.target
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
+      [Unit]
+      Description=Clevis/Tang LUKS data disks unlocked (public sync point)
+      Documentation=man:systemd.special(7)
+      Requires=clevis-unlock-data.service
+      After=clevis-unlock-data.service
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: "Reload systemd daemon"
+
+- name: "Enable the unlock sync point + clevis-luks-askpass.path"
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+  loop:
+    - clevis-luks-unlocked.target
+    - clevis-luks-askpass.path
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: "Flush handlers (daemon_reload) before continuing"
+  ansible.builtin.meta: flush_handlers

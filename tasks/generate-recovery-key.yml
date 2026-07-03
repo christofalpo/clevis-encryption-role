@@ -1,0 +1,11 @@
+---
+# First-run convenience: generate a DR passphrase and persist it as the vaulted
+# recovery key on the controller.  Thin composition reused by main.yml.
+# rotate-passphrase.yml uses generate-passphrase.yml + vault-recovery-key.yml
+# directly because it must defer the re-vault until after verification.
+
+- name: "Generate DR passphrase"
+  ansible.builtin.include_tasks: generate-passphrase.yml
+
+- name: "Persist passphrase as vaulted recovery key"
+  ansible.builtin.include_tasks: vault-recovery-key.yml

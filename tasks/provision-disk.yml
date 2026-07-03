@@ -56,6 +56,10 @@
   # Also re-bind if the device is LUKS but has no clevis token (e.g. partial
   # previous run that formatted but did not bind).
   when: disk_is_luks.rc != 0 or (disk_has_clevis is defined and disk_has_clevis.rc != 0)
+  # clevis-encrypt-tang shells out to curl to fetch /adv; CURL_HOME points it at
+  # the role's curlrc so the bind uses the same IP family the boot unlock will.
+  environment:
+    CURL_HOME: "{{ clevis_curl_home }}"
 
 # ── Open, test Tang unlock, close ─────────────────────────────────────────────
 
@@ -86,5 +90,7 @@
   delay: 5
   changed_when: tang_verify.rc == 0
   environment:
-    PATH: "{{ ansible_env.PATH }}:/usr/bin:/usr/local/bin"
+    PATH: "{{ ansible_facts.env.PATH }}:/usr/bin:/usr/local/bin"
+    # clevis-decrypt-tang curls the recovery endpoint; pin the IP family.
+    CURL_HOME: "{{ clevis_curl_home }}"
   when: disk_is_luks.rc != 0

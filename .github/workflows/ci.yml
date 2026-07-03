@@ -1,0 +1,111 @@
+---
+# Tier-0 (repository validation) + the device-free crypto scenario.
+#
+# These jobs are cheap and need no VMs, so they run on every push and PR:
+#   - validate         : YAML lint + ansible-lint (production profile)
+#   - ansible-versions : syntax-check the role across supported ansible-core
+#   - network          : Tier-0 crypto/network Molecule scenario (Docker driver)
+#
+# The heavier libvirt/KVM VM tiers (Tier-1 keyslot, Tier-2 boot ordering) live in
+# vm-tests.yml, which needs a KVM-capable runner.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ansible-compat/molecule git-init a temp dir during prerun; give git a default
+  # branch so it does not emit the "using 'master'" advice hint on the runner.
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
+jobs:
+  validate:
+    name: validate (yamllint + ansible-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install lint tooling
+        run: python -m pip install --upgrade ansible-lint yamllint
+
+      - name: Install collections (role deps + community.general for the vm scenario)
+        # requirements.yml is the role's runtime dep (ansible.posix only).
+        # community.general is needed so ansible-lint can resolve the vm
+        # scenario's prepare.yml (community.general.modprobe).  Two commands:
+        # ansible-galaxy rejects mixing -r with positional collection names.
+        run: |
+          ansible-galaxy collection install -r requirements.yml
+          ansible-galaxy collection install community.general
+
+      - name: Stub encrypted_storage_pool for lint
+        # The vm scenario's converge composes encrypted_storage_pool (installed for
+        # real by vm-tests). A stub lets ansible-lint resolve the role reference
+        # without a network clone; the scenario roles dir is excluded from linting.
+        run: |
+          mkdir -p molecule/vm/roles/encrypted_storage_pool/tasks
+          printf -- '---\n' > molecule/vm/roles/encrypted_storage_pool/tasks/main.yml
+
+      - name: yamllint
+        run: yamllint .
+
+      - name: ansible-lint
+        run: ansible-lint
+
+  ansible-versions:
+    name: syntax-check (ansible-core ${{ matrix.ansible }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ansible: ["2.16.*", "2.17.*", "2.18.*"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install ansible-core ${{ matrix.ansible }}
+        run: python -m pip install "ansible-core==${{ matrix.ansible }}"
+
+      - name: Install role collections
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: Syntax-check the role (resolved via the default scenario)
+        # The scenario's roles/ symlink resolves `clevis_encryption` to the repo
+        # root, so this parses the whole role under each ansible-core version.
+        run: |
+          ANSIBLE_ROLES_PATH=molecule/default/roles \
+            ansible-playbook -i 'localhost,' --syntax-check molecule/default/converge.yml
+
+  network:
+    name: Tier-0 crypto (molecule network, Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Molecule (Docker driver)
+        run: python -m pip install --upgrade molecule 'molecule-plugins[docker]' ansible
+
+      - name: Install collections
+        run: ansible-galaxy collection install community.docker ansible.posix
+
+      - name: molecule test -s network
+        run: molecule test -s network

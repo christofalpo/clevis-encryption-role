@@ -1,0 +1,89 @@
+---
+# Prepares the device-free network instance: stand up a LOCAL Tang on
+# 127.0.0.1:7500 (IPv4-only — makes the role's auto-probe deterministically pin
+# ipv4) and pre-create the recovery key so the LUKS provisioning block is
+# skipped.  NO loop devices, NO LUKS, NO ZFS — none of which this tier needs.
+
+- name: "Prepare container for clevis-encryption network test"
+  hosts: all
+  gather_facts: false
+  become: true
+
+  vars:
+    tang_port: 7500
+
+  tasks:
+
+    - name: "Install network-tier test dependencies (NO LUKS, NO ZFS)"
+      ansible.builtin.apt:
+        name:
+          - clevis
+          - clevis-luks
+          - tang
+          - jose
+          - jq
+          - curl
+        state: present
+        update_cache: true
+
+    # ── Local Tang on 127.0.0.1:7500 (IPv4-only) ─────────────────────────────
+    - name: "Create tangd.socket drop-in directory"
+      ansible.builtin.file:
+        path: /etc/systemd/system/tangd.socket.d
+        state: directory
+        mode: '0755'
+
+    - name: "Pin tangd.socket to IPv4 loopback port {{ tang_port }}"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/tangd.socket.d/listen.conf
+        mode: '0644'
+        content: |
+          [Socket]
+          ListenStream=
+          ListenStream=127.0.0.1:{{ tang_port }}
+
+    - name: "Generate Tang signing keys (once)"
+      # tang 15 (Debian 13) ships its binaries in the tang-common package under
+      # /usr/libexec (NOT on $PATH), so locate tangd-keygen robustly: PATH first,
+      # then the tang/tang-common file lists, then a direct search.  tangd only
+      # serves keys already present in /var/db/tang — it never generates them.
+      ansible.builtin.shell:
+        cmd: |
+          set -eo pipefail
+          kg=$(command -v tangd-keygen 2>/dev/null || true)
+          [ -n "$kg" ] || kg=$(dpkg -L tang tang-common 2>/dev/null | grep -m1 '/tangd-keygen$' || true)
+          [ -n "$kg" ] || kg=$(find /usr/libexec /usr/lib /usr/bin -name tangd-keygen 2>/dev/null | head -n1)
+          [ -n "$kg" ] || { echo "tangd-keygen not found" >&2; exit 1; }
+          mkdir -p /var/db/tang
+          if ! ls /var/db/tang/*.jwk >/dev/null 2>&1; then
+            "$kg" /var/db/tang
+            echo CHANGED
+          fi
+        executable: /bin/bash
+      register: _tang_keygen
+      changed_when: "'CHANGED' in _tang_keygen.stdout"
+
+    - name: "Enable + (re)start tangd.socket"
+      ansible.builtin.systemd:
+        name: tangd.socket
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    - name: "Wait for Tang to answer /adv"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ tang_port }}/adv"
+        status_code: 200
+      register: _tang_adv
+      retries: 10
+      delay: 1
+      until: _tang_adv.status == 200
+
+    # ── Skip the provisioning block (it needs real disks) ────────────────────
+    - name: "Create fake recovery key so provisioning block is skipped"
+      ansible.builtin.copy:
+        dest: /tmp/molecule_net_recovery_key.txt
+        content: "molecule-network-test-recovery-key\n"
+        mode: '0600'
+      delegate_to: localhost
+      become: false

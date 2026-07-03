@@ -1,0 +1,80 @@
+---
+# Re-provision a replacement encrypted disk — the NBDE half of a disk replacement.
+#
+# The operator physically swaps the dead drive, then runs this with the new bare
+# device name. We provision it with LUKS2 + Clevis/Tang (reusing provision-disk.yml),
+# write its crypttab entry (configure-disk.yml), drop the failed device's stale
+# crypttab entry, and refresh the disk-set unlock boot-ordering (the unlock
+# service's TimeoutStartSec scales with the disk count).
+#
+# The STORAGE side of a replacement (e.g. `zpool replace` + resilver) is owned by
+# the downstream storage-consumer role and runs AFTER this — this role only
+# re-provisions the encrypted mapper (crypt-<new>) and refreshes the unlock chain.
+#
+# Inputs (operator-supplied, no defaults):
+#   clevis_replace_new        new bare device name (e.g. nvme2n1)
+# Optional:
+#   clevis_replace_old_device old bare device name whose stale crypttab entry to
+#                             remove (e.g. nvme2n1); omit to leave crypttab as-is.
+
+- name: "Replace disk | validate inputs"
+  ansible.builtin.assert:
+    that:
+      - clevis_replace_new is defined and (clevis_replace_new | string | length > 0)
+    fail_msg: >-
+      replace-disk requires clevis_replace_new (the new bare device, e.g. nvme2n1).
+
+- name: "Replace disk | provision new device + refresh unlock boot ordering"
+  block:
+    - name: "Replace disk | load recovery key onto the host"
+      ansible.builtin.include_tasks: load-recovery-key.yml
+
+    - name: "Replace disk | fetch Tang advertisements (assemble SSS config)"
+      ansible.builtin.include_tasks: tang-adv.yml
+
+    - name: "Replace disk | LUKS-format + Clevis-bind + open the new device"
+      ansible.builtin.include_tasks: provision-disk.yml
+      vars:
+        disk_device: "{{ clevis_replace_new }}"
+
+    - name: "Replace disk | write crypttab entry + live discard for the new device"
+      ansible.builtin.include_tasks: configure-disk.yml
+      vars:
+        disk_device: "{{ clevis_replace_new }}"
+
+    - name: "Replace disk | remove stale crypttab entry for the old device"
+      ansible.builtin.lineinfile:
+        path: /etc/crypttab
+        regexp: "^crypt-{{ clevis_replace_old_device }}\\s"
+        state: absent
+      when:
+        - clevis_replace_old_device is defined
+        - (clevis_replace_old_device | string | length > 0)
+        - clevis_replace_old_device != clevis_replace_new
+      notify: "Rebuild initramfs"
+
+    - name: "Replace disk | re-derive the live disk set from crypt-* mappers"
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          ls -1 /dev/mapper/ | grep '^crypt-' | sed 's/^crypt-//' | sort
+        executable: /bin/bash
+      register: _rp_live_mappers
+      changed_when: false
+      check_mode: false
+
+    - name: "Replace disk | update clevis_raw_disks to the live mapper set"
+      ansible.builtin.set_fact:
+        clevis_raw_disks: "{{ _rp_live_mappers.stdout_lines }}"
+
+    - name: "Replace disk | refresh unlock boot-ordering drop-ins"
+      # Rewrites clevis-unlock-data.service (whose TimeoutStartSec depends on the
+      # disk count) + the clevis-luks-unlocked.target seam for the new disk set.
+      ansible.builtin.include_tasks: boot-ordering-dropins.yml
+
+  always:
+    - name: "Replace disk | remove temporary key from the host"
+      ansible.builtin.file:
+        path: /tmp/ansible_luks_key
+        state: absent
+      when: not (clevis_keep_temp_key | default(false) | bool)

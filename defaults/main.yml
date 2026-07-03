@@ -3,9 +3,6 @@
 # unconditionally in an install playbook but encryption is optional per host.
 clevis_encryption_enabled: true
 
-# Name of the ZFS pool that will be created on top of the encrypted devices.
-clevis_pool_name: "data"
-
 # Tang server list.  Must be overridden in group_vars or host_vars.
 # Expected shape (matches encrypt-data-disks inventory convention):
 #   tang_servers:
@@ -24,27 +21,32 @@ clevis_vault_password_file: "~/.ansible_vault_pass"
 # provisioning completes.  Leave false in production.
 clevis_keep_temp_key: false
 
-# Set to true to destroy an existing ZFS pool before (re-)provisioning.
-# This is a destructive flag — see destroy-pool.yml.
-clevis_destroy_existing: false
+# ── Boot-time unlock (fail-degraded) ──────────────────────────────────────────
+# clevis-unlock-data.service retries Clevis/Tang decryption per disk at boot,
+# distinguishing a missing block device from a decrypt failure, and always
+# continues so a downstream storage consumer's health check can decide viability.
+# Worst-case added boot delay ≈ retries × (attempt_timeout + retry_delay) ×
+# number_of_disks (only when disks actually fail every attempt); a healthy disk
+# unlocks on the first attempt.  Keep the budget modest so a genuinely-down Tang
+# degrades quickly rather than hanging the boot.
+clevis_unlock_retries: 3
+clevis_unlock_retry_delay: 5
+clevis_unlock_attempt_timeout: 20
 
-# ── ZFS pool topology ─────────────────────────────────────────────────────────
-# Controls how discovered data disks are arranged into vdevs.
-# Supported values:
-#   mirror  — pairs of disks become mirror vdevs (e.g. 6 disks → 3 mirrors).
-#             Best for read performance and redundancy.  Requires an even
-#             number of disks.
-#   raidz   — all disks in a single raidz vdev (1 parity disk).
-#   raidz2  — all disks in a single raidz2 vdev (2 parity disks).
-#   raidz3  — all disks in a single raidz3 vdev (3 parity disks).
-#   stripe  — no redundancy; all disks striped (data loss on any single disk).
-clevis_zfs_pool_topology: "mirror"
-
-# ── Proxmox storage registration ─────────────────────────────────────────────
-# This role intentionally does NOT register the pool with Proxmox.  The role's
-# job ends at "imported ZFS pool".  Proxmox-specific concerns live in
-# proxmox-install (tasks/register-zfs-storage.yml) so this role stays reusable
-# for any LUKS+ZFS deployment, not just Proxmox.
+# Options passed to the underlying `cryptsetup open` when clevis-unlock-data
+# opens each data mapper at boot (`clevis luks unlock -o`).  This is the DURABLE
+# place to enable discard: the data-disk crypttab entries carry `noauto`, so
+# systemd-cryptsetup never opens them and the crypttab `discard` option is inert
+# — the mapper only gains allow_discards if it is opened with it here.
+#
+# --allow-discards passes TRIM/discard through dm-crypt to the NVMe so the storage
+# layer's autotrim/discard can reach the device.  dm-crypt workqueue/perf flags
+# (--perf-no_read_workqueue etc.) are deliberately NOT included by default: they
+# are a storage-tuning concern owned by the proxmox_storage_tuning role.  To make
+# them durable at open too, append them here, e.g.:
+#   clevis_luks_open_options: "--allow-discards --perf-no_read_workqueue --perf-no_write_workqueue"
+# Set to "" to open with no extra options (mapper comes up without discard).
+clevis_luks_open_options: "--allow-discards"
 
 # ── DNS servers for provisioning ─────────────────────────────────────────────
 # Optional list of nameservers to prepend to /etc/resolv.conf during the
@@ -70,22 +72,42 @@ clevis_dns_servers: []
 #   clevis_recovery_key_path: "{{ playbook_dir }}/secrets/{{ inventory_hostname }}/luks_recovery_key.txt"
 clevis_recovery_key_path: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets/luks_recovery_key.txt"
 
-# Set to true to prefer IPv4 over IPv6 for all getaddrinfo() calls on the
-# host and to gate clevis-luks-askpass.service on that preference being
-# confirmed at boot.
+# ── Tang connection IP family (IPv4 / IPv6 selection) ─────────────────────────
+# Clevis fetches the Tang advertisement (at bind) and POSTs the recovery request
+# (at every unlock) using `curl`.  Because clevis invokes curl WITHOUT -q, curl
+# reads a config file — so the role pins the IP family for *clevis only* by
+# writing a curlrc and pointing curl at it via CURL_HOME (clevis_curl_home).
+# This replaces the old host-global gai.conf / disable_ipv6 approach, which was
+# silently bypassed by systemd-resolved and disabled IPv6 for the whole host.
 #
-# Specifically, this:
-#   1. Writes 'precedence ::ffff:0:0/96  100' to /etc/gai.conf so that
-#      getaddrinfo() returns A records before AAAA records for every
-#      application (clevis, curl, etc.) — the standard fix for dual-stack
-#      hosts where the IPv6 address is assigned before sysctl is applied.
-#   2. Deploys clevis-network-ready.service, which verifies both the sysctl
-#      flag and the gai.conf entry before clevis-luks-askpass.service starts.
+# Why pin a family at all — curl's Happy Eyeballs races IPv4 and IPv6 at the TCP
+# layer and commits to whichever completes the handshake first; it never
+# reconsiders based on the HTTP status.  So a dual-stack host whose Tang answers
+# the IPv6 TCP handshake (e.g. a load balancer) but returns 403 to non-whitelisted
+# IPv6 clients "wins" on IPv6 and then fails — even though IPv4 would have
+# returned the advertisement.  Pinning the family that actually yields a valid
+# adv is the only reliable fix.
 #
-# Use this when:
-#   - The host has dual-stack connectivity (Hetzner, etc.)
-#   - Your Tang servers accept IPv4 connections only
-#
-# Leave false (the default) for environments where Tang is reachable over IPv6
-# or where the network stack is purely IPv4.
+#   auto  — (default) at provision time, probe each Tang /adv over IPv4 and IPv6
+#           and bake the family that returns a valid advertisement.  Chooses
+#           `dual` (no pin) only when every server answers on BOTH families.
+#   ipv4  — force --ipv4 for every clevis curl call
+#   ipv6  — force --ipv6
+#   dual  — pin nothing; rely on curl's own dual-stack / Happy-Eyeballs logic
+clevis_curl_ip_version: auto
+
+# Directory used as CURL_HOME for clevis's curl calls; the role writes
+# <clevis_curl_home>/.curlrc here and curl reads $CURL_HOME/.curlrc.
+clevis_curl_home: /etc/clevis/curl
+
+# Per-server timeouts (seconds) for `auto` reachability probing.
+clevis_curl_probe_connect_timeout: 5
+clevis_curl_probe_max_time: 15
+
+# DEPRECATED — superseded by clevis_curl_ip_version.  When true (and
+# clevis_curl_ip_version is left at its 'auto' default) it is treated as
+# clevis_curl_ip_version=ipv4 for backward compatibility, with a deprecation
+# warning.  The legacy gai.conf precedence block, the 99-ipv6_disable.conf
+# sysctl, and clevis-network-ready.service are removed on every run regardless
+# of this flag.
 clevis_ipv4_only: false

@@ -1,0 +1,71 @@
+---
+# Verifies the device-free network tier after convergence.
+#
+# Checks:
+#   1. The role's network-prereq auto-probe wrote a curlrc pinning --ipv4
+#      (Tang is IPv4-only) and NOT --ipv6.
+#   2. The clevis<->tang round-trip works through that curlrc, and a forced
+#      wrong family (--ipv6) fails — proving the pin is read and decisive
+#      (files/harness-tang-roundtrip.sh).  No block device involved.
+#   3. The boot-ordering drop-ins that DON'T need a disk were deployed
+#      (clevis-luks-askpass network-online gate + the unlock service).
+
+- name: "Verify (device-free network tier)"
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    # ── 1. curlrc IP-family auto-probe ───────────────────────────────────────
+    - name: "Read the clevis curlrc the role wrote"
+      ansible.builtin.slurp:
+        src: /etc/clevis/curl/.curlrc
+      register: _curlrc
+
+    - name: "Assert auto-probe pinned --ipv4 (Tang is IPv4-only) and not --ipv6"
+      ansible.builtin.assert:
+        that:
+          - "'--ipv4' in (_curlrc.content | b64decode)"
+          - "'--ipv6' not in (_curlrc.content | b64decode)"
+        fail_msg: "/etc/clevis/curl/.curlrc did not auto-pin --ipv4"
+
+    # ── 2. device-free clevis<->tang round-trip (+ negative control) ──────────
+    - name: "Copy the device-free tang round-trip harness"
+      ansible.builtin.copy:
+        src: files/harness-tang-roundtrip.sh
+        dest: /root/harness-tang-roundtrip.sh
+        mode: '0755'
+
+    - name: "Run the device-free tang round-trip harness"
+      ansible.builtin.command: /root/harness-tang-roundtrip.sh /etc/clevis/curl http://127.0.0.1:7500
+      register: _rt
+      changed_when: false
+
+    - name: "Show harness output"
+      ansible.builtin.debug:
+        var: _rt.stdout_lines
+
+    - name: "Assert round-trip + negative control passed (FAIL=0)"
+      ansible.builtin.assert:
+        that:
+          - _rt.rc == 0
+          - "'FAIL=0' in _rt.stdout"
+        fail_msg: "harness-tang-roundtrip.sh reported failures — see output above"
+
+    # ── 3. device-independent boot-ordering drop-ins ─────────────────────────
+    - name: "Stat boot-ordering artifacts that need no disk"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /etc/systemd/system/clevis-luks-askpass.service.d/network-online.conf
+        - /etc/systemd/system/clevis-unlock-data.service
+      register: _dropins
+
+    - name: "Assert the device-independent drop-ins were deployed"
+      ansible.builtin.assert:
+        that: item.stat.exists
+        fail_msg: "{{ item.item }} was not deployed by boot-ordering-dropins"
+      loop: "{{ _dropins.results }}"
+      loop_control:
+        label: "{{ item.item }}"

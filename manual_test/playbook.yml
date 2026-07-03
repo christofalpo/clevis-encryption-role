@@ -1,0 +1,34 @@
+---
+# Reference playbook: provision clevis/Tang LUKS encryption + boot ordering on a
+# host that has two blank data disks, binding the unlock to an EXTERNAL Tang
+# server reached over the network.
+#
+# This is BOTH the driver for the VM boot-ordering test (manual_test/run.sh) and a
+# copy-paste example for real deployments. For real use, set tang_servers to your
+# Tang URLs, clevis_raw_disks to your data disks, and clevis_vault_password_file
+# to a real vault password file. run.sh overrides a few of these via -e for the
+# throwaway test (Tang URL, recovery-key path, vault password file).
+- name: "Provision clevis/Tang LUKS encryption + boot ordering"
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # External Tang, reached over the network. In the VM test this is the Tang
+    # container, reachable from the guest via QEMU's slirp gateway (10.0.2.2),
+    # which forwards to the Tang container published on the host loopback.
+    tang_servers:
+      - url: "http://10.0.2.2:7500"
+    # Two blank data disks -> LUKS2, unlocked at boot (NBDE). Assembling a
+    # pool/filesystem on the crypt-* mappers is a separate consumer role's job
+    # (e.g. encrypted_storage_pool / proxmox_encrypted_storage) — not exercised
+    # by this NBDE smoke test.
+    clevis_raw_disks:
+      - vdb
+      - vdc
+    # Probe IPv4/IPv6 and pin the family that serves a valid advertisement.
+    # The test Tang is IPv4-only (slirp), so this resolves to ipv4.
+    clevis_curl_ip_version: auto
+
+  roles:
+    - role: clevis_encryption

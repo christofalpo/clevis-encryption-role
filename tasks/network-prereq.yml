@@ -1,160 +1,166 @@
 ---
-# Deploys (or removes) the IPv4-only preference for Clevis Tang connections.
+# Pins the IP family that clevis's curl uses for Tang connections, by writing a
+# clevis-scoped curlrc and pointing curl at it via CURL_HOME (clevis_curl_home).
 #
-# PURPOSE
-# -------
-# On dual-stack hosts (e.g. Hetzner), getaddrinfo() returns AAAA records
-# before A records by default.  Even with net.ipv6.conf.all.disable_ipv6=1
-# in /etc/sysctl.d/, the sysctl only prevents new IPv6 addresses being
-# assigned — it does NOT remove addresses that were already configured before
-# systemd-sysctl.service ran.  On Hetzner nodes the public IPv6 address is
-# assigned by ifupdown before any sysctl is applied, so IPv6 remains fully
-# functional and getaddrinfo() still resolves AAAA records first.
+# WHY A CURLRC (and not gai.conf)
+# -------------------------------
+# clevis-encrypt-tang and clevis-decrypt-tang both call `curl -sfg …` WITHOUT
+# -q/--disable, so curl reads its config file.  curl resolves that file as
+# $CURL_HOME/.curlrc → $XDG_CONFIG_HOME/curlrc → $HOME/.curlrc.  By exporting
+# CURL_HOME wherever the role drives clevis (provision-disk bind, rotate regen,
+# and the boot-time clevis-unlock-data script) we scope the IP-family pin to
+# clevis ALONE — unlike the previous /etc/gai.conf + disable_ipv6 approach which
+# was host-global AND silently bypassed by systemd-resolved.
 #
-# The correct fix is /etc/gai.conf: setting a higher precedence for
-# IPv4-mapped addresses (::ffff:0:0/96) makes getaddrinfo() return A records
-# before AAAA records for every application on the host — clevis, curl, and
-# anything else — without requiring IPv6 to be disabled at the kernel level.
+# WHY PIN A FAMILY AT ALL
+# -----------------------
+# curl's Happy Eyeballs races v4 and v6 at the TCP layer and commits to whichever
+# connects first; it never reconsiders based on the HTTP status.  If a Tang LB
+# answers the IPv6 handshake but returns 403 to non-whitelisted clients, curl
+# "wins" on IPv6 and then fails even though IPv4 would have returned the adv.
+# So the family that yields a VALID advertisement must be selected explicitly.
 #
-# DESIGN
-# ------
-# Controlled by clevis_ipv4_only (defaults to false).  When false, any
-# previously deployed configuration is removed so the role stays idempotent.
-#
-# The clevis-network-ready.service gate is retained for boot ordering
-# (After=network-online.target, Before=clevis-luks-askpass.service) but its
-# ExecStart now verifies the gai.conf preference is in place rather than
-# checking the disable_ipv6 sysctl value, which proved insufficient.
-#
-# A separate drop-in file (ipv4-only.conf) is written to the
-# clevis-luks-askpass.service.d directory rather than modifying the existing
-# network-online.conf — keeping concerns separated and making the gate purely
-# additive.
-#
-# Called from the boot-ordering block in tasks/main.yml, after the per-disk
-# configure-disk.yml loop (which creates the drop-in directory).
+# Controlled by clevis_curl_ip_version (auto|ipv4|ipv6|dual); see defaults.
+# Called from tasks/prestage.yml (after package install + DNS config), so the
+# probe resolves Tang names through the same resolver the booted system uses.
 
-- name: "Deploy IPv4-only preference for Clevis"
-  when: clevis_ipv4_only | default(false) | bool
-  block:
+- name: "Validate clevis_curl_ip_version"
+  ansible.builtin.assert:
+    that: (clevis_curl_ip_version | default('auto')) in ['auto', 'ipv4', 'ipv6', 'dual']
+    fail_msg: "clevis_curl_ip_version must be one of: auto, ipv4, ipv6, dual"
+    quiet: true
 
-    - name: "Prefer IPv4 over IPv6 in getaddrinfo (gai.conf)"
-      # Two lines are required — raising IPv4-mapped alone is not sufficient:
-      # glibc may fall back to a built-in default of 40 for ::/0 (native IPv6),
-      # and RFC 6724 Rule 5 (prefer matching label) can still favour IPv6 before
-      # Rule 6 (precedence) is even reached.  Explicitly setting ::/0 to 1
-      # ensures native IPv6 addresses lose to IPv4-mapped (100) at Rule 6
-      # regardless of which path the glibc sort takes.
-      ansible.builtin.blockinfile:
-        path: /etc/gai.conf
-        block: |
-          precedence ::ffff:0:0/96  100
-          precedence ::/0           1
-        marker: "# {mark} ANSIBLE MANAGED clevis-encryption ipv4-only"
-        create: true
-        owner: root
-        group: root
-        mode: '0644'
+# Honour the deprecated clevis_ipv4_only flag: only when the new variable is left
+# at its 'auto' default does an explicit clevis_ipv4_only=true map to ipv4.
+- name: "Resolve effective clevis curl IP-family mode"
+  ansible.builtin.set_fact:
+    _clevis_curl_mode: >-
+      {{ clevis_curl_ip_version
+         if (clevis_curl_ip_version | default('auto')) != 'auto'
+         else ('ipv4' if (clevis_ipv4_only | default(false) | bool) else 'auto') }}
 
-    - name: "Install clevis-network-ready.service"
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/clevis-network-ready.service
-        owner: root
-        group: root
-        mode: '0644'
-        content: |
-          [Unit]
-          Description=Verify IPv4-is-preferred before Clevis Tang unlock requests
-          Documentation=man:gai.conf(5) man:clevis-luks-askpass(8)
-          # Run after the network stack is fully online so that any late
-          # interface configuration has settled before clevis starts.
-          After=network-online.target
-          Wants=network-online.target
-          # Ordering: this unit must complete before clevis-luks-askpass starts.
-          Before=clevis-luks-askpass.service
+- name: "Warn that clevis_ipv4_only is deprecated"
+  ansible.builtin.debug:
+    msg: >-
+      DEPRECATION: clevis_ipv4_only is superseded by clevis_curl_ip_version and
+      was mapped to clevis_curl_ip_version=ipv4. Set clevis_curl_ip_version
+      explicitly (auto|ipv4|ipv6|dual) and remove clevis_ipv4_only.
+  when:
+    - clevis_ipv4_only | default(false) | bool
+    - (clevis_curl_ip_version | default('auto')) == 'auto'
 
-          [Service]
-          Type=oneshot
-          RemainAfterExit=yes
-          # Two independent checks — both must pass before clevis is allowed
-          # to start making Tang requests.  With Type=oneshot, multiple
-          # ExecStart lines run in order and the service fails on the first
-          # non-zero exit, so each check is expressed separately for clarity.
-          #
-          # Check 1: disable_ipv6 sysctl confirms the kernel will not assign
-          # new IPv6 addresses to interfaces going forward.
-          ExecStart=/bin/sh -c 'sysctl -n net.ipv6.conf.all.disable_ipv6 | grep -qx 1'
-          # Check 2: gai.conf IPv4 precedence confirms that getaddrinfo()
-          # returns A records before AAAA records.  This is the effective
-          # guard on dual-stack Hetzner hosts where the IPv6 address is
-          # assigned before systemd-sysctl.service runs and therefore remains
-          # active regardless of the sysctl value — without this preference
-          # clevis resolves Tang hostnames to IPv6 first and connects to Tang
-          # servers that may only accept IPv4 clients.
-          ExecStart=grep -q "^precedence[[:space:]]*::ffff:0:0/96[[:space:]]*100" /etc/gai.conf
+# ── Detect the working IP family (auto mode only) ────────────────────────────
+- name: "Probe Tang /adv reachability per IP family (auto mode)"
+  # Probes with the SAME tool and flags clevis will use (curl -fg --ipvN), so the
+  # result reflects what clevis actually experiences — including an L7 reject that
+  # a bare TCP probe would miss (-f makes any non-2xx, e.g. 403, a failure).
+  # Emits ipv4 | ipv6 | dual | unknown on stdout; per-server diagnostics on stderr.
+  # Never hard-fails: if NOTHING is reachable it emits `unknown` and warns —
+  # the write step then PRESERVES any existing pin (so a transient Tang outage
+  # during a routine re-run can't clobber a known-good family) and the real,
+  # loud failure comes from the actual bind/unlock step, which is the correct
+  # place to fail (this also keeps boot-ordering-only / CI runs green).
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -uo pipefail
+      ct={{ clevis_curl_probe_connect_timeout | int }}
+      mt={{ clevis_curl_probe_max_time | int }}
+      v4=0; v6=0; total=0
+      for url in {{ tang_servers | map(attribute='url') | map('quote') | join(' ') }}; do
+        total=$((total + 1))
+        if curl -sfg --ipv4 --connect-timeout "$ct" --max-time "$mt" -o /dev/null "$url/adv"; then
+          v4=$((v4 + 1)); echo "probe: $url -> IPv4 OK" >&2
+        else
+          echo "probe: $url -> IPv4 FAIL" >&2
+        fi
+        if curl -sfg --ipv6 --connect-timeout "$ct" --max-time "$mt" -o /dev/null "$url/adv"; then
+          v6=$((v6 + 1)); echo "probe: $url -> IPv6 OK" >&2
+        else
+          echo "probe: $url -> IPv6 FAIL" >&2
+        fi
+      done
+      echo "probe: summary reachable v4=$v4 v6=$v6 of total=$total" >&2
+      if [ "$v4" -eq 0 ] && [ "$v6" -eq 0 ]; then
+        echo "probe: WARNING no Tang server reachable over IPv4 or IPv6; keeping any existing pin (else dual)" >&2
+        echo unknown
+      elif [ "$v4" -eq "$total" ] && [ "$v6" -eq "$total" ]; then
+        echo dual
+      elif [ "$v4" -ge "$v6" ]; then
+        echo ipv4
+      else
+        echo ipv6
+      fi
+  register: _clevis_curl_probe
+  changed_when: false
+  check_mode: false
+  when: _clevis_curl_mode == 'auto'
 
-          [Install]
-          # Pulled in automatically when clevis-luks-askpass.service is enabled.
-          WantedBy=clevis-luks-askpass.service
-      notify: "Reload systemd daemon"
+- name: "Select clevis curl IP family (probe result in auto, else explicit)"
+  ansible.builtin.set_fact:
+    clevis_curl_family: >-
+      {{ (_clevis_curl_probe.stdout | trim)
+         if _clevis_curl_mode == 'auto'
+         else _clevis_curl_mode }}
 
-    - name: "Enable clevis-network-ready.service"
-      ansible.builtin.systemd:
-        name: clevis-network-ready.service
-        enabled: true
-        # daemon_reload: true — the service file was just written above; without
-        # reloading, systemd does not yet know the unit exists and the enable
-        # call fails with "Could not find the requested service".
-        daemon_reload: true
-      ignore_errors: "{{ ansible_check_mode }}"
+- name: "Show the selected clevis curl IP family"
+  ansible.builtin.debug:
+    msg: "clevis Tang curl IP family = {{ clevis_curl_family }} (mode={{ _clevis_curl_mode }})"
 
-    - name: "Ensure clevis-luks-askpass.service.d drop-in directory exists"
-      # When network-prereq runs as part of prestage (PR #10), this fires
-      # before the boot-ordering block that also creates this directory.
-      # On hosts that have never had clevis drop-ins before, the ipv4-only.conf
-      # write below would fail with "Destination directory … does not exist".
-      # Idempotent — also safe when the boot-ordering block creates it later.
-      ansible.builtin.file:
-        path: /etc/systemd/system/clevis-luks-askpass.service.d
-        state: directory
-        mode: '0755'
-        owner: root
-        group: root
+# ── Write the clevis-scoped curlrc ───────────────────────────────────────────
+- name: "Ensure CURL_HOME directory exists for clevis"
+  ansible.builtin.file:
+    path: "{{ clevis_curl_home }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
 
-    - name: "Add clevis-luks-askpass drop-in: require network gate"
-      # Separate drop-in file so it can be removed independently of the
-      # network-online.conf ordering that configure-disk.yml manages.
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/clevis-luks-askpass.service.d/ipv4-only.conf
-        owner: root
-        group: root
-        mode: '0644'
-        content: |
-          [Unit]
-          # Block unlock attempts until clevis-network-ready has confirmed that
-          # the IPv4 preference is in place.
-          After=clevis-network-ready.service
-          Wants=clevis-network-ready.service
-      notify: "Reload systemd daemon"
+- name: "Check for an existing clevis curlrc"
+  ansible.builtin.stat:
+    path: "{{ clevis_curl_home }}/.curlrc"
+  register: _clevis_curlrc_stat
 
-- name: "Remove IPv4-only preference (clevis_ipv4_only is false)"
-  when: not (clevis_ipv4_only | default(false) | bool)
-  block:
+# 'unknown' (auto probe found nothing reachable) is treated as 'dual' ONLY when
+# no curlrc exists yet; when one exists it is preserved (write step is skipped),
+# so a transient Tang outage can't downgrade a known-good pin.
+- name: "Resolve the effective curlrc family + flag"
+  ansible.builtin.set_fact:
+    _clevis_curlrc_family: "{{ 'dual' if clevis_curl_family == 'unknown' else clevis_curl_family }}"
+    _clevis_curlrc_flag: >-
+      {{ '--ipv4' if clevis_curl_family == 'ipv4'
+         else ('--ipv6' if clevis_curl_family == 'ipv6' else '') }}
 
-    - name: "Remove IPv4-only precedence block from gai.conf if present"
-      ansible.builtin.blockinfile:
-        path: /etc/gai.conf
-        marker: "# {mark} ANSIBLE MANAGED clevis-encryption ipv4-only"
-        state: absent
+- name: "Preserve existing curlrc (Tang unreachable; pin left unchanged)"
+  ansible.builtin.debug:
+    msg: >-
+      No Tang reachable over either family and a curlrc already exists at
+      {{ clevis_curl_home }}/.curlrc — leaving the current pin unchanged.
+  when:
+    - clevis_curl_family == 'unknown'
+    - _clevis_curlrc_stat.stat.exists
 
-    - name: "Remove clevis-network-ready.service if present"
-      ansible.builtin.file:
-        path: /etc/systemd/system/clevis-network-ready.service
-        state: absent
-      notify: "Reload systemd daemon"
+- name: "Write clevis curlrc (IP family: {{ _clevis_curlrc_family }})"
+  # Skipped only when the probe found nothing reachable AND a curlrc already
+  # exists — see the preserve note above.
+  when: clevis_curl_family != 'unknown' or not _clevis_curlrc_stat.stat.exists
+  ansible.builtin.copy:
+    dest: "{{ clevis_curl_home }}/.curlrc"
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+      # Do not edit by hand; regenerated on each role run.
+      #
+      # Read by curl via CURL_HOME={{ clevis_curl_home }} for every Tang request
+      # clevis makes: the advertisement fetch at bind and the recovery POST at
+      # unlock.  Pins the IP family so Happy Eyeballs cannot commit to a family
+      # whose Tang answers the TCP handshake but rejects the request at L7.
+      # Selected IP family: {{ _clevis_curlrc_family }}
+      {{ _clevis_curlrc_flag }}
 
-    - name: "Remove ipv4-only drop-in from clevis-luks-askpass if present"
-      ansible.builtin.file:
-        path: /etc/systemd/system/clevis-luks-askpass.service.d/ipv4-only.conf
-        state: absent
-      notify: "Reload systemd daemon"
+# NOTE: the legacy host-global IPv4-only gate that this curlrc supersedes
+# (gai.conf precedence block, clevis-network-ready.service + its drop-in, the
+# 99-ipv6_disable.conf sysctl) is retired by tasks/cleanup-legacy.yml, which runs
+# first from main.yml — not here, so this file is purely the desired-state pin.

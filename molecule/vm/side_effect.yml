@@ -1,0 +1,28 @@
+---
+# The heart of the Tier-2 test: REBOOT the encrypted host so the boot chain runs
+# for real.  Only after a reboot do the data disks get unlocked at boot by
+# clevis-unlock-data from the EXTERNAL Tang over the network, the decoupled
+# import chain fire, and allow_discards prove durable — none of which the
+# provisioning run (converge) exercises.  verify.yml asserts the post-reboot state.
+- name: "Reboot the encrypted host to exercise the real boot chain"
+  hosts: clevis-target
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: "Reboot and wait for SSH to return"
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+
+    - name: "Wait for the boot chain to settle (encrypted-storage-ready.target)"  # noqa: command-instead-of-module
+      # sshd returns at multi-user.target, but the unlock -> import -> pool-check
+      # -> ready.target chain is network-ordered with retry delays, so it can
+      # still be running when SSH is back.  Wait for the barrier before verify
+      # asserts (active = done; otherwise verify reports the real failure).
+      ansible.builtin.command: systemctl is-active encrypted-storage-ready.target
+      register: _ready
+      until: _ready.stdout == "active"
+      retries: 40
+      delay: 5
+      changed_when: false
+      failed_when: false

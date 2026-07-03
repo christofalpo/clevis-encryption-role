@@ -1,0 +1,172 @@
+---
+# Consolidated cleanup of artifacts that PREVIOUS versions of this role deployed
+# and that the current design no longer uses.  Runs on every invocation
+# (tags: always in main.yml) so any node — however old the version that last
+# touched it — converges to the current desired state.
+#
+# OWNERSHIP PRINCIPLE (see git f580265 "stop deleting files the role can't prove
+# it owns" and 8186493 "stamp every deployed file with an ownership header"):
+# a reusable role must NEVER blind-delete a generically-named file in a shared or
+# foreign directory, because it might clobber a file an operator or a different
+# role legitimately owns.  So removals here fall into three safety tiers:
+#
+#   Tier 1  Provably ours by NAME — a unit/symlink whose name is unique to this
+#           role (e.g. clevis-network-ready.service).  Removed when present.
+#   Tier 2  Marker-scoped — an Ansible blockinfile block delimited by this role's
+#           marker inside a shared file (gai.conf).  Only the marked block goes.
+#   Tier 3  Content-guarded — a generic name and/or a foreign service's drop-in
+#           dir.  Removed ONLY when the file's content carries this role's
+#           ownership header OR a distinctive signature it always wrote.  A
+#           same-named foreign file with neither is PRESERVED (and logged).
+#
+# Everything here is idempotent and a no-op on a host that never ran an old
+# version.  This file performs NO desired-state writes — those live in
+# network-prereq.yml (curlrc) and boot-ordering-dropins.yml (the current units).
+
+- name: "Cleanup | ownership marker stamped on files this role writes"
+  ansible.builtin.set_fact:
+    _clevis_ownership_marker: "Managed by Ansible role: clevis_encryption"
+
+# ── Tier 1: units/symlinks whose name is unique to this role ─────────────────
+# clevis-network-ready.service (the old IPv4-preference boot gate) — no other
+# software names a unit this, so the name alone proves ownership.
+- name: "Cleanup | stat legacy clevis-network-ready.service"
+  ansible.builtin.stat:
+    path: /etc/systemd/system/clevis-network-ready.service
+  register: _legacy_cnr
+
+- name: "Cleanup | disable legacy clevis-network-ready.service"
+  ansible.builtin.systemd:
+    name: clevis-network-ready.service
+    enabled: false
+  when: _legacy_cnr.stat.exists
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: "Cleanup | remove legacy clevis-network-ready unit + its wants symlink"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/clevis-network-ready.service
+    - /etc/systemd/system/clevis-luks-askpass.service.wants/clevis-network-ready.service
+  notify: "Reload systemd daemon"
+
+# ── Tier 2: marker-scoped block inside a shared file ─────────────────────────
+# The old IPv4-only precedence block in /etc/gai.conf.  blockinfile removes only
+# the text between this role's markers, leaving any operator content intact.
+- name: "Cleanup | stat /etc/gai.conf"
+  ansible.builtin.stat:
+    path: /etc/gai.conf
+  register: _legacy_gai
+
+- name: "Cleanup | remove the clevis IPv4-only precedence block from /etc/gai.conf"
+  ansible.builtin.blockinfile:
+    path: /etc/gai.conf
+    marker: "# {mark} ANSIBLE MANAGED clevis-encryption ipv4-only"
+    state: absent
+  when: _legacy_gai.stat.exists
+
+# ── Tier 3: content-guarded removals (generic names / foreign drop-in dirs) ──
+# Each entry lists the path and the distinctive signature(s) this role wrote into
+# it across its history.  The ownership header is appended to every guard, so
+# files written by recent (header-stamped) versions always match too.
+- name: "Cleanup | define content-guarded legacy candidates"
+  ansible.builtin.set_fact:
+    _clevis_legacy_guarded:
+      # NOTE: the old zfs-import-* ordering drop-ins are a STORAGE concern and are
+      # now cleaned up by the storage-consumer role (proxmox_encrypted_storage's
+      # cleanup-legacy.yml, guarding on the same historical needles). This NBDE
+      # role no longer touches them.
+      # The networking early-bring-up drop-in that was validated to BREAK boot.
+      # Previously left for the operator (f580265); now removed automatically but
+      # ONLY when its distinctive ordering line proves this role wrote it.
+      - path: /etc/systemd/system/networking.service.d/10-override.conf
+        needles: ["ifupdown2-pre.service sysinit.target"]
+      # The IPv4-only drop-in that gated clevis-luks-askpass on clevis-network-ready.
+      - path: /etc/systemd/system/clevis-luks-askpass.service.d/ipv4-only.conf
+        needles: [clevis-network-ready]
+
+- name: "Cleanup | stat content-guarded legacy candidates"
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+  loop: "{{ _clevis_legacy_guarded }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: _legacy_stat
+
+- name: "Cleanup | reduce to existing, non-symlink candidates"
+  ansible.builtin.set_fact:
+    _legacy_existing: >-
+      {{ _legacy_stat.results
+         | selectattr('stat.exists')
+         | rejectattr('stat.islnk')
+         | map(attribute='item')
+         | list }}
+
+- name: "Cleanup | read existing candidates (to confirm ownership before removal)"
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ _legacy_existing }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: _legacy_read
+
+- name: "Cleanup | remove legacy files whose content proves this role wrote them"
+  ansible.builtin.file:
+    path: "{{ item.item.path }}"
+    state: absent
+  loop: "{{ _legacy_read.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  when: >-
+    ((item.item.needles + [_clevis_ownership_marker])
+     | select('in', item.content | b64decode) | list | length) > 0
+  notify: "Reload systemd daemon"
+
+- name: "Cleanup | preserve same-named files the role cannot prove it owns"
+  ansible.builtin.debug:
+    msg: >-
+      Preserved {{ item.item.path }} — it exists but carries no clevis-encryption
+      ownership signature, so the role will not remove a file it cannot prove it
+      wrote. Remove it manually if you know it is a stale clevis-encryption artifact.
+  loop: "{{ _legacy_read.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  when: >-
+    ((item.item.needles + [_clevis_ownership_marker])
+     | select('in', item.content | b64decode) | list | length) == 0
+
+# ── Tier 3 (coupled live-state undo): the host-global IPv6 disable ───────────
+# 99-ipv6_disable.conf forced IPv4 for Tang host-wide; the IP family is now
+# scoped to clevis via a curlrc, so this file is removed and IPv6 is re-enabled
+# on the live kernel (a prerequisite for the ipv6/dual curl modes).  Guarded on
+# content so a same-named operator file with other sysctls is left alone.
+- name: "Cleanup | stat legacy IPv6-disable sysctl file"
+  ansible.builtin.stat:
+    path: /etc/sysctl.d/99-ipv6_disable.conf
+  register: _legacy_v6
+
+- name: "Cleanup | read legacy IPv6-disable sysctl file"
+  ansible.builtin.slurp:
+    src: /etc/sysctl.d/99-ipv6_disable.conf
+  when: _legacy_v6.stat.exists
+  register: _legacy_v6_read
+
+- name: "Cleanup | remove role-owned IPv6-disable sysctl file + re-enable IPv6 live"
+  when:
+    - _legacy_v6.stat.exists
+    - "'disable_ipv6' in (_legacy_v6_read.content | b64decode)"
+  block:
+    - name: "Cleanup | remove /etc/sysctl.d/99-ipv6_disable.conf"
+      ansible.builtin.file:
+        path: /etc/sysctl.d/99-ipv6_disable.conf
+        state: absent
+
+    - name: "Cleanup | reset disable_ipv6 to 0 on the live kernel"
+      # Removing the file does not reset the running value; do it explicitly so
+      # the new ipv6/dual modes work without a reboot.
+      ansible.builtin.command: "sysctl -w {{ item }}=0"
+      loop:
+        - net.ipv6.conf.default.disable_ipv6
+        - net.ipv6.conf.all.disable_ipv6
+      changed_when: true

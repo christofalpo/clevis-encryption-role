@@ -1,0 +1,70 @@
+---
+# Tier-0 (network) scenario: validate the clevis<->tang CRYPTO + NETWORK layer
+# — the IP-family selection this branch is about — WITHOUT any block device,
+# LUKS, or block-device privilege.  Unlike the `default` scenario it needs no
+# loop devices / MKNOD, so it runs under ROOTLESS podman and any plain CI runner.
+#
+# How it stays device-free: clevis_raw_disks is set to [] so the role's
+# per-disk loops (configure-disk) and provisioning are empty/skipped; only
+# cleanup-legacy + prestage (package install + network-prereq curlrc auto-probe)
+# + the disk-set boot-ordering drop-ins run.  systemd is still PID 1 so the
+# local Tang can run from its socket unit.
+dependency:
+  name: galaxy
+
+driver:
+  name: docker
+
+platforms:
+  - name: clevis-encryption-net-debian13
+    image: geerlingguy/docker-debian13-ansible:latest
+    pre_build_image: true
+    # privileged + cgroup mount are for systemd (PID 1) so tangd.socket works;
+    # NO loop devices / MKNOD are needed — that is the whole point of this tier.
+    privileged: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    command: /lib/systemd/systemd
+    tmpfs:
+      - /run
+      - /run/lock
+      - /tmp
+
+provisioner:
+  name: ansible
+  config_options:
+    defaults:
+      interpreter_python: auto_silent
+  inventory:
+    host_vars:
+      clevis-encryption-net-debian13:
+        # Device-free: an empty disk list empties configure-disk's per-disk loop
+        # and the boot-ordering timeout maths, so nothing touches a block device.
+        clevis_raw_disks: []
+        # Pre-created by prepare.yml so the provisioning block (LUKS bind) is
+        # skipped — provisioning needs real disks.
+        clevis_recovery_key_path: "/tmp/molecule_net_recovery_key.txt"
+        tang_servers:
+          - url: "http://127.0.0.1:7500"
+        # Exercise the REAL auto-probe: prepare.yml runs Tang on 127.0.0.1:7500
+        # bound to IPv4 only, so the probe sees v4 OK / v6 FAIL and pins ipv4.
+        clevis_curl_ip_version: auto
+        clevis_vault_password_file: "/dev/null"
+
+scenario:
+  # Explicit sequence: omit dependency (collections are installed outside
+  # molecule), and cleanup / side_effect (no such playbooks in this scenario),
+  # so `molecule test` emits no "Missing playbook/requirements" warnings.
+  test_sequence:
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - idempotence
+    - verify
+    - destroy
+
+verifier:
+  name: ansible

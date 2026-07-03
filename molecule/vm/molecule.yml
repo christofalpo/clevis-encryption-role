@@ -1,0 +1,91 @@
+---
+# Tier-2 (VM boot-ordering) scenario on Vagrant + libvirt/KVM.
+#
+# Proves clevis's REAL boot chain: the data disks are unlocked at BOOT from an
+# EXTERNAL Tang over the network, clevis-luks-unlocked.target is reached, and a
+# downstream consumer assembles storage ordered after that seam — surviving a
+# reboot, with allow_discards durable. clevis runs NBDE-ONLY here; the consumer is
+# the generic encrypted_storage_pool role (btrfs — mainline, no DKMS), installed
+# from its own repo. This validates clevis's bring-up WITHOUT ZFS in clevis.
+#
+# Topology — two VMs on Vagrant's NAT management network:
+#   clevis-tang   : the EXTERNAL Tang server, deliberately OFF the encrypted host
+#   clevis-target : two blank data disks (vdb,vdc) -> LUKS2 -> a btrfs raid1
+# Rootless via the libvirt group + qemu_use_session=false, cachier disabled — see
+# molecule/default for the full rationale.
+dependency:
+  name: galaxy
+
+driver:
+  name: vagrant
+  provider:
+    name: libvirt
+  cachier: disabled
+
+platforms:
+  - name: clevis-tang
+    box: debian/trixie64
+    memory: 1024
+    cpus: 1
+    provider_options:
+      qemu_use_session: false
+
+  - name: clevis-target
+    box: debian/trixie64
+    # No DKMS build any more (btrfs is mainline), so 2 GB is plenty.
+    memory: 2048
+    cpus: 2
+    provider_options:
+      qemu_use_session: false
+    provider_raw_config_args:
+      - "storage :file, :size => '2G', :type => 'qcow2', :bus => 'virtio', :device => 'vdb'"
+      - "storage :file, :size => '2G', :type => 'qcow2', :bus => 'virtio', :device => 'vdc'"
+
+provisioner:
+  name: ansible
+  env:
+    # Resolve both roles from the scenario roles/ dir: clevis_encryption via the
+    # committed self-symlink, encrypted_storage_pool installed there by CI (galaxy).
+    ANSIBLE_ROLES_PATH: "${MOLECULE_SCENARIO_DIRECTORY}/roles"
+  config_options:
+    defaults:
+      interpreter_python: auto_silent
+  inventory:
+    host_vars:
+      clevis-target:
+        # External Tang in the clevis-tang VM (IPv4 literal → auto-probe pins --ipv4).
+        tang_servers:
+          - url: "http://{{ hostvars['clevis-tang'].ansible_host }}:7500"
+        clevis_raw_disks:
+          - vdb
+          - vdc
+        clevis_curl_ip_version: auto
+        # Provisioning MUST run here: prepare.yml removes the controller-side
+        # recovery-key file so the gate opens (LUKS format + clevis bind). Dedicated
+        # dir (NOT /tmp itself — the role chmods dirname to 0700, which fails on /tmp).
+        clevis_recovery_key_path: /tmp/molecule-vm-secrets/recovery-key.txt
+        clevis_vault_password_file: /tmp/molecule-vm-secrets/vault-pass
+        # clevis is NBDE-only (v2.0.0) — it provisions LUKS + unlock; the consumer
+        # below owns the pool. encrypted_storage_pool consumer (btrfs raid1).
+        encrypted_storage_pool_backend: btrfs
+        encrypted_storage_pool_name: data
+        encrypted_storage_pool_topology: mirror
+        encrypted_storage_pool_devices:
+          - vdb
+          - vdc
+
+scenario:
+  # create -> prepare -> converge (provision) -> side_effect (REBOOT) -> verify.
+  # Idempotence omitted: one-shot provisioning + boot test, the reboot is the point.
+  test_sequence:
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - side_effect
+    - verify
+    - destroy
+
+verifier:
+  name: ansible

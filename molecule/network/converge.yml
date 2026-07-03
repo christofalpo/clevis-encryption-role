@@ -1,0 +1,17 @@
+---
+# Applies the clevis-encryption role to the device-free network instance.
+#
+# With clevis_raw_disks: [] and the recovery key pre-staged, the role runs only:
+#   - cleanup-legacy (no-op here — nothing planted in this scenario)
+#   - prestage: package install + network-prereq.yml (the curlrc IP-family
+#     auto-probe — pins --ipv4 because the local Tang is IPv4-only)
+#   - boot-ordering drop-ins (disk-set level; device-independent)
+# Provisioning (LUKS bind) and ensure-pool are skipped — they need real disks.
+
+- name: "Converge (device-free network tier)"
+  hosts: all
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: clevis_encryption
